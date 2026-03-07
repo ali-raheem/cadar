@@ -1,0 +1,29 @@
+import Text_IO;
+use Text_IO;
+import Checks;
+
+package Checks {
+    fn Within_Limit(Integer Value, Integer Limit) -> Boolean
+        requires(Limit >= 0)
+        ensures(result or else Value > Limit);
+}
+
+package body Checks {
+    fn Within_Limit(Integer Value, Integer Limit) -> Boolean
+        requires(Limit >= 0)
+        ensures(result or else Value > Limit) {
+        if (Value <= Limit) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+fn Main() {
+    if (Checks.Within_Limit(3, 5)) {
+        Put_Line("within");
+    } else {
+        Put_Line("outside");
+    }
+}

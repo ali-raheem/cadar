@@ -1,0 +1,13 @@
+import Text_IO;
+use Text_IO;
+import Math;
+
+package body Math {
+    fn Twice(Integer Value) -> Integer {
+        return Value + Value;
+    }
+}
+
+fn Main() {
+    Put_Line(Integer.image(Math.Twice(4)));
+}

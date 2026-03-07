@@ -1,0 +1,28 @@
+import Text_IO;
+use Text_IO;
+
+fn Main() {
+    Integer Count = 0;
+
+    while (Count < 2) {
+        Put_Line("tick");
+        Count = Count + 1;
+    }
+
+    for (Integer I in 1..2) {
+        Put_Line("step");
+    }
+
+    if ((Count == 2) and then true) {
+        case (Count) {
+            when 2 => {
+                Put_Line("done");
+            }
+            else => {
+                Put_Line("bad");
+            }
+        }
+    } else {
+        Put_Line("bad");
+    }
+}

@@ -1,0 +1,43 @@
+import Text_IO;
+use Text_IO;
+import Models;
+
+package Models {
+    type Point = record {
+        Integer X;
+        Integer Y;
+    };
+    enum Axis { X, Y }
+    type Speed = Integer range 0..300;
+    fn Sum(Point P) -> Integer;
+    fn Axis_Name(Axis Selected) -> String;
+}
+
+package body Models {
+    fn Sum(Point P) -> Integer {
+        return P.X + P.Y;
+    }
+
+    fn Axis_Name(Axis Selected) -> String {
+        case (Selected) {
+            when X => {
+                return "X axis";
+            }
+            when Y => {
+                return "Y axis";
+            }
+        }
+    }
+}
+
+fn Main() {
+    Models.Point P;
+    Models.Speed Current = 120;
+
+    P.X = 2;
+    P.Y = 5;
+
+    Put_Line(Models.Axis_Name(Models.X));
+    Put_Line(Integer.image(Models.Sum(P)));
+    Put_Line(Integer.image(Current));
+}

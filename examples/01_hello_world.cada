@@ -1,0 +1,6 @@
+import Text_IO;
+use Text_IO;
+
+fn Main() {
+    Put_Line("Hello from CADA");
+}
