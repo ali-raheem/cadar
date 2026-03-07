@@ -21,6 +21,12 @@ pub struct Diagnostic {
     pub position: Position,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedDiagnostic {
+    pub source_index: usize,
+    pub diagnostic: Diagnostic,
+}
+
 impl Diagnostic {
     pub fn new(message: impl Into<String>, position: Position) -> Self {
         Self {
@@ -75,3 +81,12 @@ impl fmt::Display for Diagnostic {
 }
 
 impl std::error::Error for Diagnostic {}
+
+impl IndexedDiagnostic {
+    pub fn new(source_index: usize, diagnostic: Diagnostic) -> Self {
+        Self {
+            source_index,
+            diagnostic,
+        }
+    }
+}

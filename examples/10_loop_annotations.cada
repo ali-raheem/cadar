@@ -1,0 +1,23 @@
+import Text_IO;
+use Text_IO;
+
+fn Main() {
+    Integer Count = 0;
+
+    while (Count < 3)
+        invariant(Count >= 0)
+        invariant(Count <= 3)
+        increases(Count)
+    {
+        Count = Count + 1;
+    }
+
+    for (Integer I in 1..2)
+        invariant(I >= 1)
+        decreases(2 - I)
+    {
+        Put_Line("tick");
+    }
+
+    Put_Line(Integer.image(Count));
+}

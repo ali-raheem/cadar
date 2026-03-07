@@ -242,6 +242,215 @@ fn split_units_writes_package_and_subprogram_files() {
 }
 
 #[test]
+fn split_units_adds_with_clause_for_called_top_level_subprogram() {
+    let root = temp_test_dir("split-top-level-call");
+    let input_path = root.join("bundle.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Adjust(Integer Value) -> Integer {
+            return Value + 1;
+        }
+
+        fn Main() {
+            Put_Line(Integer.image(Adjust(2)));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("main.adb")).expect("main body should exist"),
+        "with Text_IO;\nuse Text_IO;\nwith Adjust;\n\nprocedure Main is\nbegin\n   Put_Line(Integer'Image(Adjust(2)));\nend Main;"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_accept_multiple_input_files() {
+    let root = temp_test_dir("split-multi-file");
+    let adjust_path = root.join("adjust.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &adjust_path,
+        r#"
+        fn Adjust(Integer Value) -> Integer {
+            return Value + 1;
+        }
+        "#,
+    )
+    .expect("adjust input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line(Integer.image(Adjust(2)));
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&adjust_path)
+        .arg(&main_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("adjust.ads")).expect("adjust spec should exist"),
+        "function Adjust(Value : Integer) return Integer;"
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("main.adb")).expect("main body should exist"),
+        "with Text_IO;\nuse Text_IO;\nwith Adjust;\n\nprocedure Main is\nbegin\n   Put_Line(Integer'Image(Adjust(2)));\nend Main;"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn maps_transpile_errors_to_the_correct_input_file() {
+    let root = temp_test_dir("multi-file-error");
+    let helper_path = root.join("helper.cada");
+    let broken_path = root.join("broken.cada");
+
+    fs::write(
+        &helper_path,
+        r#"
+        fn Helper() {
+        }
+        "#,
+    )
+    .expect("helper input should be written");
+    fs::write(
+        &broken_path,
+        "fn Main() {\n    Integer Count = 1;\n    Count + 1;\n}\n",
+    )
+    .expect("broken input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg(&helper_path)
+        .arg(&broken_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("--> {}:3:5", broken_path.display())),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("3 |     Count + 1;"),
+        "unexpected stderr: {stderr}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn multi_file_use_visibility_is_file_local() {
+    let root = temp_test_dir("multi-file-use-scope");
+    let globals_path = root.join("globals.cada");
+    let main_path = root.join("main.cada");
+    let broken_path = root.join("broken.cada");
+
+    fs::write(
+        &globals_path,
+        r#"
+        package Globals {
+            Integer Counter = 1;
+        }
+        "#,
+    )
+    .expect("globals input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        use Globals;
+
+        fn Main() {
+            Integer Value = Counter;
+        }
+        "#,
+    )
+    .expect("main input should be written");
+    fs::write(
+        &broken_path,
+        r#"
+        fn Broken() {
+            Integer Value = Counter;
+        }
+        "#,
+    )
+    .expect("broken input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg(&globals_path)
+        .arg(&main_path)
+        .arg(&broken_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("undefined identifier `Counter`"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("--> {}:3:", broken_path.display())),
+        "unexpected stderr: {stderr}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
 fn split_units_uses_fallback_file_for_top_level_types() {
     let root = temp_test_dir("split-types");
     let input_path = root.join("shapes.cada");
@@ -276,16 +485,17 @@ fn split_units_uses_fallback_file_for_top_level_types() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        fs::read_to_string(out_dir.join("shapes.ads")).expect("aggregate spec should exist"),
-        "type Point is record\n   X : Integer;\n   Y : Integer;\nend record;"
+        fs::read_to_string(out_dir.join("cadar_shapes_support.ads"))
+            .expect("support package spec should exist"),
+        "package Cadar_shapes_Support is\n   type Point is record\n      X : Integer;\n      Y : Integer;\n   end record;\nend Cadar_shapes_Support;"
     );
     assert_eq!(
         fs::read_to_string(out_dir.join("main.ads")).expect("main spec should exist"),
-        "procedure Main;"
+        "with Cadar_shapes_Support;\nuse Cadar_shapes_Support;\n\nprocedure Main;"
     );
     assert_eq!(
         fs::read_to_string(out_dir.join("main.adb")).expect("main body should exist"),
-        "procedure Main is\nbegin\n   null;\nend Main;"
+        "with Cadar_shapes_Support;\nuse Cadar_shapes_Support;\n\nprocedure Main is\nbegin\n   null;\nend Main;"
     );
 
     fs::remove_dir_all(root).expect("temp dir should be removed");

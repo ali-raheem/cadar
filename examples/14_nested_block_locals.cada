@@ -1,0 +1,18 @@
+import Text_IO;
+use Text_IO;
+
+fn Main() {
+    Integer Total = 0;
+
+    if (true) {
+        Integer Step = 2;
+        Total = Total + Step;
+    }
+
+    while (Total < 5) {
+        Integer Step = 1;
+        Total = Total + Step;
+    }
+
+    Put_Line(Integer.image(Total));
+}

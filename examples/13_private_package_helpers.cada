@@ -1,0 +1,24 @@
+import Text_IO;
+use Text_IO;
+import Math;
+
+package Math {
+    fn Sum(Integer A, Integer B) -> Integer;
+}
+
+package body Math {
+    fn Clamp(Integer Value) -> Integer {
+        if (Value < 0) {
+            return 0;
+        }
+        return Value;
+    }
+
+    fn Sum(Integer A, Integer B) -> Integer {
+        return Clamp(A) + Clamp(B);
+    }
+}
+
+fn Main() {
+    Put_Line(Integer.image(Math.Sum(-3, 7)));
+}

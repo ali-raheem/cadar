@@ -1,0 +1,20 @@
+import Text_IO;
+use Text_IO;
+import State;
+
+package State {
+    Integer Count = 0;
+    fn Next() -> Integer;
+}
+
+package body State {
+    fn Next() -> Integer {
+        Count = Count + 1;
+        return Count;
+    }
+}
+
+fn Main() {
+    Put_Line(Integer.image(State.Next()));
+    Put_Line(Integer.image(State.Next()));
+}

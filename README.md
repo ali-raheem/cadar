@@ -61,14 +61,23 @@ cadar --write --split-units --out-dir build/hello examples/01_hello_world.cada
 The current compiler is a real end-to-end pipeline:
 
 - lexer, parser, AST, semantic validation, Ada lowering, pretty-printing, and CLI
+- one or more `.cada` input files per CLI invocation
 - functions and procedures, including grouped parameter modes
 - imports and `use`
-- local declarations, constants, assignments, returns, and call statements
+- local declarations, including nested control-flow block locals, constants,
+  assignments, returns, and call statements
 - control flow: `if`, `while`, `for`, `case`, and `null`
-- packages, package bodies, and derived specs for body-only packages
+- body assertions with `assert(...)`
+- loop invariants and loop variants
+- SPARK-style dataflow contracts with `global(...)` and `depends(...)`
+- packages, package bodies, package-level object declarations, body-private
+  helper subprograms, and derived specs for body-only packages
 - contracts with `requires(...)` and `ensures(...)`
 - record types, enum types, and range subtypes
+- constrained arrays, array literals, and indexing
+- float and character literals
 - qualified names and a small attribute surface such as `Integer.image(X)`
+- named call arguments and defaulted parameters
 - aggregate output or split-unit Ada file emission
 - GNAT-backed integration tests, including the repository examples
 
@@ -80,10 +89,8 @@ feature-rich and are intended to show the current usable subset.
 Important remaining work includes:
 
 - richer name resolution and more precise type checking
-- arrays, aggregates, and more complete expression/type support
-- named arguments and defaulted parameters
-- more SPARK-oriented features such as assertions, loop invariants, and
-  `Global`/`Depends`
+- more complete expression and type coverage
+- more SPARK-oriented features such as `Refined_Post`
 - more Ada coverage: private/tagged types, generics, exceptions, and tasking
 - tighter source mapping, better diagnostics, and more output/toolchain polish
 - optional `gnatprove` integration

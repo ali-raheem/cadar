@@ -1,0 +1,15 @@
+import Text_IO;
+use Text_IO;
+
+fn Main() {
+    Float Value = 1.5;
+    Character Letter = 'A';
+
+    if (Value > 1.0) {
+        Put_Line("float");
+    }
+
+    if (Letter == 'A') {
+        Put_Line("char");
+    }
+}

@@ -1,0 +1,18 @@
+import Text_IO;
+use Text_IO;
+
+fn Add(Integer A, Integer B) -> Integer
+    global(null)
+    depends(result => [A, B]) {
+    return A + B;
+}
+
+fn Show(Integer Value)
+    global(null)
+    depends(null => Value) {
+    Put_Line(Integer.image(Value));
+}
+
+fn Main() {
+    Show(Add(2, 3));
+}

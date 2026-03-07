@@ -1,0 +1,11 @@
+import Text_IO;
+use Text_IO;
+
+fn Adjust(Integer Value, Integer Scale = 10, Integer Offset = 1) -> Integer {
+    return Value * Scale + Offset;
+}
+
+fn Main() {
+    Put_Line(Integer.image(Adjust(2)));
+    Put_Line(Integer.image(Adjust(2, Offset = 5, Scale = 3)));
+}

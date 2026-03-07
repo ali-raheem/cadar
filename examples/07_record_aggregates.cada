@@ -1,0 +1,14 @@
+import Text_IO;
+use Text_IO;
+
+type Point = record {
+    Integer X;
+    Integer Y;
+};
+
+fn Main() {
+    Point First = Point { X = 1, Y = 2 };
+    Point Second = Point { Y = 4, X = 3 };
+
+    Put_Line(Integer.image(First.X + First.Y + Second.X + Second.Y));
+}

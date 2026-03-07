@@ -20,6 +20,8 @@ pub enum TokenKind {
     Return,
     Requires,
     Ensures,
+    Global,
+    Depends,
     For,
     In,
     If,
@@ -27,6 +29,10 @@ pub enum TokenKind {
     Case,
     When,
     While,
+    Assert,
+    Invariant,
+    Increases,
+    Decreases,
     Null,
     Then,
     And,
@@ -36,9 +42,13 @@ pub enum TokenKind {
     False,
     Identifier(String),
     Integer(String),
+    Float(String),
+    Character(char),
     String(String),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     Comma,
@@ -104,6 +114,14 @@ impl<'a> Lexer<'a> {
                 b')' => {
                     self.bump();
                     TokenKind::RParen
+                }
+                b'[' => {
+                    self.bump();
+                    TokenKind::LBracket
+                }
+                b']' => {
+                    self.bump();
+                    TokenKind::RBracket
                 }
                 b'{' => {
                     self.bump();
@@ -194,7 +212,8 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'"' => TokenKind::String(self.lex_string(position)?),
-                b'0'..=b'9' => TokenKind::Integer(self.lex_integer()),
+                b'\'' => TokenKind::Character(self.lex_character(position)?),
+                b'0'..=b'9' => self.lex_number(),
                 b'A'..=b'Z' | b'a'..=b'z' | b'_' => self.lex_identifier_or_keyword(),
                 _ => {
                     return Err(Diagnostic::new(
@@ -274,12 +293,54 @@ impl<'a> Lexer<'a> {
         Err(Diagnostic::new("unterminated string literal", position))
     }
 
-    fn lex_integer(&mut self) -> String {
+    fn lex_character(&mut self, position: Position) -> Result<char, Diagnostic> {
+        self.bump();
+        let Some(byte) = self.peek() else {
+            return Err(Diagnostic::new("unterminated character literal", position));
+        };
+        if matches!(byte, b'\'' | b'\n') {
+            return Err(Diagnostic::new(
+                "character literals must contain exactly one character",
+                position,
+            ));
+        }
+
+        self.bump();
+        let value = byte as char;
+
+        match self.peek() {
+            Some(b'\'') => {
+                self.bump();
+                Ok(value)
+            }
+            Some(b'\n') | None => Err(Diagnostic::new("unterminated character literal", position)),
+            _ => Err(Diagnostic::new(
+                "character literals must contain exactly one character",
+                position,
+            )),
+        }
+    }
+
+    fn lex_number(&mut self) -> TokenKind {
         let start = self.index;
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.bump();
         }
-        String::from_utf8(self.source[start..self.index].to_vec()).expect("integer is ASCII")
+
+        if self.peek() == Some(b'.') && matches!(self.peek_next(), Some(b'0'..=b'9')) {
+            self.bump();
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.bump();
+            }
+
+            return TokenKind::Float(
+                String::from_utf8(self.source[start..self.index].to_vec()).expect("float is ASCII"),
+            );
+        }
+
+        TokenKind::Integer(
+            String::from_utf8(self.source[start..self.index].to_vec()).expect("integer is ASCII"),
+        )
     }
 
     fn lex_identifier_or_keyword(&mut self) -> TokenKind {
@@ -305,6 +366,8 @@ impl<'a> Lexer<'a> {
             "return" => TokenKind::Return,
             "requires" => TokenKind::Requires,
             "ensures" => TokenKind::Ensures,
+            "global" => TokenKind::Global,
+            "depends" => TokenKind::Depends,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "if" => TokenKind::If,
@@ -312,6 +375,10 @@ impl<'a> Lexer<'a> {
             "case" => TokenKind::Case,
             "when" => TokenKind::When,
             "while" => TokenKind::While,
+            "assert" => TokenKind::Assert,
+            "invariant" => TokenKind::Invariant,
+            "increases" => TokenKind::Increases,
+            "decreases" => TokenKind::Decreases,
             "null" => TokenKind::Null,
             "then" => TokenKind::Then,
             "and" => TokenKind::And,

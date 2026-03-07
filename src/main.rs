@@ -5,7 +5,7 @@ use std::{
     process,
 };
 
-use cadar::{AdaOutputs, GeneratedFile};
+use cadar::{AdaOutputs, GeneratedFile, IndexedDiagnostic, SourceInput};
 
 fn main() {
     if let Err(error) = run() {
@@ -21,36 +21,29 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let source = match &cli.input_path {
-        Some(path) => fs::read_to_string(path).map_err(|error| error.to_string())?,
-        None => {
-            let mut source = String::new();
-            io::stdin()
-                .read_to_string(&mut source)
-                .map_err(|error| error.to_string())?;
-            source
-        }
-    };
-    let diagnostic_label = cli
-        .input_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<stdin>".to_string());
+    let bundle = read_source_bundle(&cli)?;
+    let sources = bundle
+        .documents
+        .iter()
+        .map(|document| SourceInput {
+            source: &document.source,
+        })
+        .collect::<Vec<_>>();
 
     if cli.write_files {
         if cli.split_units {
             let fallback_stem = resolve_fallback_stem(&cli);
-            let files = cadar::transpile_files(&source, &fallback_stem)
-                .map_err(|error| error.render_with_source(&source, Some(&diagnostic_label)))?;
+            let files = cadar::transpile_project_files(&sources, &fallback_stem)
+                .map_err(|error| render_source_diagnostic(error, &bundle))?;
             write_split_files(&cli, &files).map_err(|error| error.to_string())?;
         } else {
-            let outputs = cadar::transpile(&source)
-                .map_err(|error| error.render_with_source(&source, Some(&diagnostic_label)))?;
+            let outputs = cadar::transpile_project(&sources)
+                .map_err(|error| render_source_diagnostic(error, &bundle))?;
             write_outputs(&cli, &outputs).map_err(|error| error.to_string())?;
         }
     } else {
-        let outputs = cadar::transpile(&source)
-            .map_err(|error| error.render_with_source(&source, Some(&diagnostic_label)))?;
+        let outputs = cadar::transpile_project(&sources)
+            .map_err(|error| render_source_diagnostic(error, &bundle))?;
         print_outputs(&outputs);
     }
 
@@ -59,7 +52,7 @@ fn run() -> Result<(), String> {
 
 #[derive(Debug, Default)]
 struct Cli {
-    input_path: Option<PathBuf>,
+    input_paths: Vec<PathBuf>,
     write_files: bool,
     split_units: bool,
     out_dir: Option<PathBuf>,
@@ -96,10 +89,7 @@ impl Cli {
                     return Err(format!("unknown option `{arg}`"));
                 }
                 _ => {
-                    if cli.input_path.is_some() {
-                        return Err("usage: cadar [--write] [--out-dir DIR] [--basename NAME] [path/to/file.cada]".to_string());
-                    }
-                    cli.input_path = Some(PathBuf::from(arg));
+                    cli.input_paths.push(PathBuf::from(arg));
                 }
             }
         }
@@ -120,14 +110,14 @@ impl Cli {
 }
 
 fn usage() -> &'static str {
-    "Usage: cadar [--write] [--out-dir DIR] [--basename NAME] [path/to/file.cada]\n\n\
-Reads CADA source from a file or stdin.\n\
+    "Usage: cadar [--write] [--split-units] [--out-dir DIR] [--basename NAME] [path/to/file1.cada ...]\n\n\
+Reads CADA source from one or more files, or from stdin when no input paths are given.\n\
 \n\
 Options:\n\
   --write           Write .ads/.adb files instead of printing to stdout\n\
   --split-units     Write one Ada file per top-level package/subprogram unit\n\
   --out-dir DIR     Directory for emitted files when using --write\n\
-  --basename NAME   File stem to use when writing files from stdin\n\
+  --basename NAME   File stem to use when writing aggregate files from stdin\n\
   -h, --help        Show this help text\n"
 }
 
@@ -173,7 +163,7 @@ fn resolve_basename(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         return Ok(name.clone());
     }
 
-    let Some(input_path) = &cli.input_path else {
+    let Some(input_path) = cli.input_paths.first() else {
         return Err("`--basename` is required when using `--write` with stdin".into());
     };
 
@@ -193,7 +183,7 @@ fn resolve_out_dir(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Ok(path.clone());
     }
 
-    if let Some(input_path) = &cli.input_path {
+    if let Some(input_path) = cli.input_paths.first() {
         return Ok(input_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -208,7 +198,7 @@ fn resolve_fallback_stem(cli: &Cli) -> String {
         return name.clone();
     }
 
-    if let Some(input_path) = &cli.input_path
+    if let Some(input_path) = cli.input_paths.first()
         && let Some(stem) = input_path.file_stem().and_then(|stem| stem.to_str())
     {
         return stem.to_string();
@@ -229,4 +219,50 @@ fn print_outputs(outputs: &AdaOutputs) {
         println!("-- body (.adb)");
         println!("{}", outputs.body);
     }
+}
+
+#[derive(Debug)]
+struct SourceBundle {
+    documents: Vec<SourceDocument>,
+}
+
+#[derive(Debug)]
+struct SourceDocument {
+    label: String,
+    source: String,
+}
+
+fn read_source_bundle(cli: &Cli) -> Result<SourceBundle, String> {
+    let mut documents = Vec::new();
+
+    if cli.input_paths.is_empty() {
+        let mut source = String::new();
+        io::stdin()
+            .read_to_string(&mut source)
+            .map_err(|error| error.to_string())?;
+        documents.push(SourceDocument {
+            label: "<stdin>".to_string(),
+            source,
+        });
+    } else {
+        for path in &cli.input_paths {
+            let source = fs::read_to_string(path).map_err(|error| error.to_string())?;
+            documents.push(SourceDocument {
+                label: path.display().to_string(),
+                source,
+            });
+        }
+    }
+
+    Ok(SourceBundle { documents })
+}
+
+fn render_source_diagnostic(error: IndexedDiagnostic, bundle: &SourceBundle) -> String {
+    let Some(document) = bundle.documents.get(error.source_index) else {
+        return error.diagnostic.to_string();
+    };
+
+    error
+        .diagnostic
+        .render_with_source(&document.source, Some(&document.label))
 }

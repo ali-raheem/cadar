@@ -1,0 +1,11 @@
+import Text_IO;
+use Text_IO;
+
+fn Check_Positive(Integer Value) {
+    assert(Value > 0);
+}
+
+fn Main() {
+    Check_Positive(3);
+    Put_Line("assert passed");
+}

@@ -1,9 +1,12 @@
+use std::collections::HashSet;
+
 use crate::{
     ast::{
-        BinaryOp, Block, BlockItem, CaseArm, CaseStatement, ElseIfBranch, EnumType, Expr,
-        ForStatement, IfStatement, Item, LocalDecl, Name, Package, PackageItem, Param, ParamMode,
-        Program, RangeType, RecordField, RecordType, Statement, StatementBlock, Subprogram,
-        TypeDecl, UnaryOp,
+        ArrayType, BinaryOp, Block, BlockItem, CallArg, CaseArm, CaseStatement, DependItem,
+        DependTarget, DependsContract, ElseIfBranch, EnumType, Expr, ForStatement, GlobalContract,
+        GlobalItem, GlobalMode, IfStatement, Item, LocalDecl, LoopVariant, LoopVariantDirection,
+        Name, Package, PackageItem, Param, ParamMode, Program, RangeType, RecordField,
+        RecordFieldInit, RecordType, Statement, StatementBlock, Subprogram, TypeDecl, UnaryOp,
     },
     diagnostic::{Diagnostic, Position},
     lexer::{Token, TokenKind},
@@ -82,7 +85,9 @@ impl<'a> Parser<'a> {
             TokenKind::Fn => Ok(PackageItem::Subprogram(self.parse_subprogram()?)),
             TokenKind::Type => Ok(PackageItem::Type(self.parse_type_decl()?)),
             TokenKind::Enum => Ok(PackageItem::Type(self.parse_enum_decl()?)),
-            _ => Err(self.error_here("expected `fn`, `type`, or `enum` inside package")),
+            _ if self.looks_like_local_decl() => Ok(PackageItem::Object(self.parse_local_decl()?)),
+            _ => Err(self
+                .error_here("expected `fn`, `type`, `enum`, or object declaration inside package")),
         }
     }
 
@@ -102,9 +107,11 @@ impl<'a> Parser<'a> {
 
         let mut requires = Vec::new();
         let mut ensures = Vec::new();
+        let mut global = None;
+        let mut depends = None;
         while matches!(
             self.current_kind(),
-            TokenKind::Requires | TokenKind::Ensures
+            TokenKind::Requires | TokenKind::Ensures | TokenKind::Global | TokenKind::Depends
         ) {
             match self.current_kind() {
                 TokenKind::Requires => {
@@ -119,7 +126,23 @@ impl<'a> Parser<'a> {
                     ensures.push(self.parse_expr()?);
                     self.expect_simple(TokenKind::RParen, "expected `)` after `ensures`")?;
                 }
-                _ => unreachable!("contract loop should only match requires/ensures"),
+                TokenKind::Global => {
+                    if global.is_some() {
+                        return Err(
+                            self.error_here("subprogram cannot contain multiple `global` clauses")
+                        );
+                    }
+                    global = Some(self.parse_global_contract()?);
+                }
+                TokenKind::Depends => {
+                    if depends.is_some() {
+                        return Err(
+                            self.error_here("subprogram cannot contain multiple `depends` clauses")
+                        );
+                    }
+                    depends = Some(self.parse_depends_contract()?);
+                }
+                _ => unreachable!("contract loop should only match supported clauses"),
             }
         }
 
@@ -137,6 +160,8 @@ impl<'a> Parser<'a> {
             return_type,
             requires,
             ensures,
+            global,
+            depends,
             body,
             position,
         })
@@ -171,12 +196,134 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    fn parse_global_contract(&mut self) -> Result<GlobalContract, Diagnostic> {
+        self.expect_simple(TokenKind::Global, "expected `global`")?;
+        self.expect_simple(TokenKind::LParen, "expected `(` after `global`")?;
+
+        if self.matches_simple(&TokenKind::Null) {
+            self.expect_simple(TokenKind::RParen, "expected `)` after `global(null)`")?;
+            return Ok(GlobalContract {
+                items: vec![GlobalItem {
+                    mode: GlobalMode::Null,
+                    names: Vec::new(),
+                }],
+            });
+        }
+
+        let mut items = Vec::new();
+        let mut seen_modes = HashSet::new();
+        loop {
+            let mode = self.parse_global_mode()?;
+            if !seen_modes.insert(mode) {
+                return Err(self.error_here("duplicate mode in `global` clause"));
+            }
+            self.expect_simple(TokenKind::FatArrow, "expected `=>` after global mode")?;
+            let names = self.parse_contract_name_list()?;
+            items.push(GlobalItem { mode, names });
+
+            if !self.matches_simple(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect_simple(TokenKind::RParen, "expected `)` after `global` clause")?;
+        Ok(GlobalContract { items })
+    }
+
+    fn parse_global_mode(&mut self) -> Result<GlobalMode, Diagnostic> {
+        match self.current_kind() {
+            TokenKind::Identifier(text) => {
+                let mode = match text.as_str() {
+                    "input" => GlobalMode::Input,
+                    "output" => GlobalMode::Output,
+                    "in_out" => GlobalMode::InOut,
+                    "proof_in" => GlobalMode::ProofIn,
+                    _ => {
+                        return Err(self.error_here(
+                            "expected `input`, `output`, `in_out`, or `proof_in` in `global` clause",
+                        ));
+                    }
+                };
+                self.bump();
+                Ok(mode)
+            }
+            _ => Err(self.error_here(
+                "expected `input`, `output`, `in_out`, or `proof_in` in `global` clause",
+            )),
+        }
+    }
+
+    fn parse_depends_contract(&mut self) -> Result<DependsContract, Diagnostic> {
+        self.expect_simple(TokenKind::Depends, "expected `depends`")?;
+        self.expect_simple(TokenKind::LParen, "expected `(` after `depends`")?;
+
+        let mut items = Vec::new();
+        let mut seen_targets = HashSet::new();
+        loop {
+            let target = self.parse_depend_target()?;
+            if !seen_targets.insert(depend_target_key(&target)) {
+                return Err(self.error_here("duplicate target in `depends` clause"));
+            }
+            self.expect_simple(TokenKind::FatArrow, "expected `=>` in `depends` clause")?;
+            let sources = self.parse_contract_name_list()?;
+            items.push(DependItem { target, sources });
+
+            if !self.matches_simple(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect_simple(TokenKind::RParen, "expected `)` after `depends` clause")?;
+        Ok(DependsContract { items })
+    }
+
+    fn parse_depend_target(&mut self) -> Result<DependTarget, Diagnostic> {
+        if self.matches_simple(&TokenKind::Null) {
+            return Ok(DependTarget::Null);
+        }
+
+        if let TokenKind::Identifier(text) = self.current_kind()
+            && text == "result"
+        {
+            self.bump();
+            return Ok(DependTarget::Result);
+        }
+
+        Ok(DependTarget::Name(self.parse_name()?))
+    }
+
+    fn parse_contract_name_list(&mut self) -> Result<Vec<Name>, Diagnostic> {
+        if self.matches_simple(&TokenKind::LBracket) {
+            let mut names = Vec::new();
+            loop {
+                names.push(self.parse_name()?);
+                if !self.matches_simple(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect_simple(TokenKind::RBracket, "expected `]` after name list")?;
+            Ok(names)
+        } else {
+            Ok(vec![self.parse_name()?])
+        }
+    }
+
     fn parse_param_group(&mut self, mode: ParamMode) -> Result<Vec<Param>, Diagnostic> {
         let mut params = Vec::new();
         loop {
             let ty = self.parse_name()?;
             let name = self.expect_identifier("expected a parameter name")?;
-            params.push(Param { mode, ty, name });
+            let default = if self.matches_simple(&TokenKind::Assign) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            params.push(Param {
+                mode,
+                ty,
+                name,
+                default,
+            });
 
             if !self.matches_simple(&TokenKind::Comma) {
                 break;
@@ -197,6 +344,22 @@ impl<'a> Parser<'a> {
             return Ok(TypeDecl::Record(RecordType {
                 name,
                 fields,
+                position,
+            }));
+        }
+
+        if self.matches_simple(&TokenKind::LBracket) {
+            let start = self.parse_expr()?;
+            self.expect_simple(TokenKind::DotDot, "expected `..` in array type")?;
+            let end = self.parse_expr()?;
+            self.expect_simple(TokenKind::RBracket, "expected `]` after array bounds")?;
+            let element_type = self.parse_name()?;
+            self.expect_simple(TokenKind::Semicolon, "expected `;` after array type")?;
+            return Ok(TypeDecl::Array(ArrayType {
+                name,
+                start,
+                end,
+                element_type,
                 position,
             }));
         }
@@ -301,6 +464,14 @@ impl<'a> Parser<'a> {
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after `null`")?;
                 Ok(Statement::Null { position })
             }
+            TokenKind::Assert => {
+                self.bump();
+                self.expect_simple(TokenKind::LParen, "expected `(` after `assert`")?;
+                let expr = self.parse_expr()?;
+                self.expect_simple(TokenKind::RParen, "expected `)` after assert expression")?;
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after `assert`")?;
+                Ok(Statement::Assert { expr, position })
+            }
             TokenKind::Return => {
                 self.bump();
                 let expr = self.parse_expr()?;
@@ -312,18 +483,16 @@ impl<'a> Parser<'a> {
             TokenKind::Case => self.parse_case_statement(),
             TokenKind::While => self.parse_while_statement(),
             TokenKind::Identifier(_) => {
-                if self.looks_like_assignment() {
-                    let target = self.parse_name()?;
-                    self.expect_simple(TokenKind::Assign, "expected `=` in assignment")?;
+                let expr = self.parse_expr()?;
+                if self.matches_simple(&TokenKind::Assign) {
                     let value = self.parse_expr()?;
                     self.expect_simple(TokenKind::Semicolon, "expected `;` after assignment")?;
                     Ok(Statement::Assign {
-                        target,
+                        target: expr,
                         value,
                         position,
                     })
                 } else {
-                    let expr = self.parse_expr()?;
                     self.expect_simple(TokenKind::Semicolon, "expected `;` after expression")?;
                     Ok(Statement::Expr { expr, position })
                 }
@@ -376,9 +545,12 @@ impl<'a> Parser<'a> {
         self.expect_simple(TokenKind::LParen, "expected `(` after `while`")?;
         let condition = self.parse_expr()?;
         self.expect_simple(TokenKind::RParen, "expected `)` after while condition")?;
+        let (invariants, variants) = self.parse_loop_annotations()?;
         let body = self.parse_statement_block()?;
         Ok(Statement::While {
             condition,
+            invariants,
+            variants,
             body,
             position,
         })
@@ -446,6 +618,7 @@ impl<'a> Parser<'a> {
         self.expect_simple(TokenKind::DotDot, "expected `..` in for loop range")?;
         let end = self.parse_expr()?;
         self.expect_simple(TokenKind::RParen, "expected `)` after for loop header")?;
+        let (invariants, variants) = self.parse_loop_annotations()?;
         let body = self.parse_statement_block()?;
 
         Ok(Statement::For(ForStatement {
@@ -453,19 +626,65 @@ impl<'a> Parser<'a> {
             iterator,
             start,
             end,
+            invariants,
+            variants,
             body,
             position,
         }))
     }
 
+    fn parse_loop_annotations(&mut self) -> Result<(Vec<Expr>, Vec<LoopVariant>), Diagnostic> {
+        let mut invariants = Vec::new();
+        let mut variants = Vec::new();
+
+        loop {
+            match self.current_kind() {
+                TokenKind::Invariant => {
+                    self.bump();
+                    self.expect_simple(TokenKind::LParen, "expected `(` after `invariant`")?;
+                    invariants.push(self.parse_expr()?);
+                    self.expect_simple(
+                        TokenKind::RParen,
+                        "expected `)` after invariant expression",
+                    )?;
+                }
+                TokenKind::Increases => {
+                    self.bump();
+                    self.expect_simple(TokenKind::LParen, "expected `(` after `increases`")?;
+                    let expr = self.parse_expr()?;
+                    self.expect_simple(TokenKind::RParen, "expected `)` after variant expression")?;
+                    variants.push(LoopVariant {
+                        direction: LoopVariantDirection::Increases,
+                        expr,
+                    });
+                }
+                TokenKind::Decreases => {
+                    self.bump();
+                    self.expect_simple(TokenKind::LParen, "expected `(` after `decreases`")?;
+                    let expr = self.parse_expr()?;
+                    self.expect_simple(TokenKind::RParen, "expected `)` after variant expression")?;
+                    variants.push(LoopVariant {
+                        direction: LoopVariantDirection::Decreases,
+                        expr,
+                    });
+                }
+                _ => return Ok((invariants, variants)),
+            }
+        }
+    }
+
     fn parse_statement_block(&mut self) -> Result<StatementBlock, Diagnostic> {
         self.expect_simple(TokenKind::LBrace, "expected `{`")?;
-        let mut statements = Vec::new();
+        let mut items = Vec::new();
         while !self.check(&TokenKind::RBrace) {
-            statements.push(self.parse_statement()?);
+            if self.looks_like_local_decl() {
+                items.push(BlockItem::LocalDecl(self.parse_local_decl()?));
+            } else {
+                items.push(BlockItem::Statement(self.parse_statement()?));
+            }
         }
         self.expect_simple(TokenKind::RBrace, "expected `}`")?;
-        Ok(StatementBlock { statements })
+        Ok(StatementBlock { items })
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
@@ -662,21 +881,39 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
+            if self.matches_simple(&TokenKind::LBracket) {
+                let position = expr.position();
+                let index = self.parse_expr()?;
+                self.expect_simple(TokenKind::RBracket, "expected `]` after index expression")?;
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    index: Box::new(index),
+                    position,
+                };
+                continue;
+            }
+
             if self.matches_simple(&TokenKind::LParen) {
                 let position = expr.position();
-                let mut args = Vec::new();
-                if !self.check(&TokenKind::RParen) {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.matches_simple(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                }
+                let args = self.parse_call_args()?;
                 self.expect_simple(TokenKind::RParen, "expected `)` after arguments")?;
                 expr = Expr::Call {
                     callee: Box::new(expr),
                     args,
+                    position,
+                };
+                continue;
+            }
+
+            if self.matches_simple(&TokenKind::LBrace) {
+                let position = expr.position();
+                let Some(ty) = expr_to_name(&expr) else {
+                    return Err(self.error_here("record aggregates require a type name"));
+                };
+                let fields = self.parse_record_literal_fields()?;
+                expr = Expr::RecordLiteral {
+                    ty,
+                    fields,
                     position,
                 };
                 continue;
@@ -708,6 +945,16 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Expr::Integer { value, position })
             }
+            TokenKind::Float(value) => {
+                let value = value.clone();
+                self.bump();
+                Ok(Expr::Float { value, position })
+            }
+            TokenKind::Character(value) => {
+                let value = *value;
+                self.bump();
+                Ok(Expr::Character { value, position })
+            }
             TokenKind::String(value) => {
                 let value = value.clone();
                 self.bump();
@@ -719,6 +966,20 @@ impl<'a> Parser<'a> {
                 },
                 position,
             }),
+            TokenKind::LBracket => {
+                self.bump();
+                let mut elements = Vec::new();
+                if !self.check(&TokenKind::RBracket) {
+                    loop {
+                        elements.push(self.parse_expr()?);
+                        if !self.matches_simple(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect_simple(TokenKind::RBracket, "expected `]` after array literal")?;
+                Ok(Expr::ArrayLiteral { elements, position })
+            }
             TokenKind::LParen => {
                 self.bump();
                 let expr = self.parse_expr()?;
@@ -727,6 +988,57 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.error_here("expected an expression")),
         }
+    }
+
+    fn parse_record_literal_fields(&mut self) -> Result<Vec<RecordFieldInit>, Diagnostic> {
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::RBrace) {
+            loop {
+                let name = self.expect_identifier("expected a record field name")?;
+                self.expect_simple(TokenKind::Assign, "expected `=` after record field name")?;
+                let value = self.parse_expr()?;
+                fields.push(RecordFieldInit { name, value });
+                if !self.matches_simple(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+            }
+        }
+        self.expect_simple(TokenKind::RBrace, "expected `}` after record aggregate")?;
+        Ok(fields)
+    }
+
+    fn parse_call_args(&mut self) -> Result<Vec<CallArg>, Diagnostic> {
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                let position = self.current().position;
+                let arg = if self.looks_like_named_call_arg() {
+                    let name = self.expect_identifier("expected a parameter name")?;
+                    self.expect_simple(TokenKind::Assign, "expected `=` after parameter name")?;
+                    let value = self.parse_expr()?;
+                    CallArg {
+                        name: Some(name),
+                        value,
+                        position,
+                    }
+                } else {
+                    let value = self.parse_expr()?;
+                    CallArg {
+                        name: None,
+                        position: value.position(),
+                        value,
+                    }
+                };
+                args.push(arg);
+                if !self.matches_simple(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(args)
     }
 
     fn parse_name(&mut self) -> Result<Name, Diagnostic> {
@@ -759,14 +1071,9 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn looks_like_assignment(&self) -> bool {
-        let Some(cursor) = self.advance_name(self.index) else {
-            return false;
-        };
-        if self.name_ends_with_attribute(cursor) {
-            return false;
-        }
-        matches!(self.kind_at(cursor), Some(TokenKind::Assign))
+    fn looks_like_named_call_arg(&self) -> bool {
+        matches!(self.current_kind(), TokenKind::Identifier(_))
+            && self.kind_at(self.index + 1) == Some(&TokenKind::Assign)
     }
 
     fn advance_name(&self, mut cursor: usize) -> Option<usize> {
@@ -782,16 +1089,6 @@ impl<'a> Parser<'a> {
             cursor += 1;
         }
         Some(cursor)
-    }
-
-    fn name_ends_with_attribute(&self, end: usize) -> bool {
-        let last_identifier = end.checked_sub(1).and_then(|index| self.kind_at(index));
-        match last_identifier {
-            Some(TokenKind::Identifier(name)) => {
-                matches!(name.as_str(), "length" | "range" | "image")
-            }
-            _ => false,
-        }
     }
 
     fn expect_identifier(&mut self, message: &str) -> Result<String, Diagnostic> {
@@ -865,5 +1162,25 @@ impl<'a> Parser<'a> {
 
     fn error_here(&self, message: &str) -> Diagnostic {
         Diagnostic::new(message, self.current().position)
+    }
+}
+
+fn expr_to_name(expr: &Expr) -> Option<Name> {
+    match expr {
+        Expr::Name { name, .. } => Some(name.clone()),
+        Expr::Member { base, member, .. } => {
+            let mut name = expr_to_name(base)?;
+            name.segments.push(member.clone());
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+fn depend_target_key(target: &DependTarget) -> String {
+    match target {
+        DependTarget::Null => "null".to_string(),
+        DependTarget::Result => "result".to_string(),
+        DependTarget::Name(name) => name.as_string(),
     }
 }

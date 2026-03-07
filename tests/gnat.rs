@@ -17,6 +17,16 @@ fn gnat_compiles_and_runs_repository_examples() {
         "03_packages_and_contracts",
         "04_types_and_ranges",
         "05_body_only_package",
+        "06_arrays",
+        "07_record_aggregates",
+        "08_named_args_and_defaults",
+        "09_asserts",
+        "10_loop_annotations",
+        "11_dataflow_contracts",
+        "12_package_state",
+        "13_private_package_helpers",
+        "14_nested_block_locals",
+        "15_float_and_character_literals",
     ] {
         run_repository_example(stem);
     }
@@ -172,15 +182,100 @@ fn gnat_compiles_split_package_program_without_self_import_cycle() {
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }
 
+#[test]
+fn gnat_compiles_split_top_level_subprogram_dependencies() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-top-level-deps");
+    let input_path = root.join("program.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Adjust(Integer Value) -> Integer {
+            return Value + 1;
+        }
+
+        fn Main() {
+            Put_Line(Integer.image(Adjust(2)));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_multi_file_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-multi-file");
+    let adjust_path = root.join("adjust.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &adjust_path,
+        r#"
+        fn Adjust(Integer Value) -> Integer {
+            return Value + 1;
+        }
+        "#,
+    )
+    .expect("adjust input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line(Integer.image(Adjust(2)));
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    run_cadar_split_many(&[&adjust_path, &main_path], &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
 fn run_cadar_split(input_path: &Path, out_dir: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+    run_cadar_split_many(&[input_path], out_dir);
+}
+
+fn run_cadar_split_many(input_paths: &[&Path], out_dir: &Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cadar"));
+    command
         .arg("--write")
         .arg("--split-units")
         .arg("--out-dir")
-        .arg(out_dir)
-        .arg(input_path)
-        .output()
-        .expect("cadar should run");
+        .arg(out_dir);
+    for input_path in input_paths {
+        command.arg(input_path);
+    }
+
+    let output = command.output().expect("cadar should run");
 
     assert!(
         output.status.success(),
