@@ -65,8 +65,8 @@ The current compiler is a real end-to-end pipeline:
 - functions and procedures, including grouped parameter modes
 - imports and `use`
 - local declarations, including nested control-flow block locals, constants,
-  assignments, returns, and call statements
-- control flow: `if`, `while`, `for`, `case`, and `null`
+  assignments, procedure `return;`, value returns, and call statements
+- control flow: `if`, `while`, `for`, `case`, `null`, `break`, and `continue`
 - body assertions with `assert(...)`
 - loop invariants and loop variants
 - SPARK-style dataflow contracts with `global(...)` and `depends(...)`
@@ -83,6 +83,28 @@ The current compiler is a real end-to-end pipeline:
 
 The examples in [`examples/`](examples/) are ordered from minimal to more
 feature-rich and are intended to show the current usable subset.
+
+## Current Supported Use
+
+Today, the most reliable path is:
+
+- package-based CADA programs
+- `--write --split-units` output
+- GNAT compile/run in CI on the generated Ada
+
+Important current limit:
+
+- split-unit output requires unique top-level Ada library unit names, so
+  top-level overload sets are not supported there yet; put overloads inside a
+  package or use aggregate output instead
+- identifiers that differ only by case are rejected, because Ada treats them as
+  the same name
+- external package-qualified references should be explicit: add `import P;` or
+  `use P;` before referring to `P.X`
+- external top-level subprogram calls should also be explicit: add
+  `import Name;` before calling another library-unit subprogram like `Name(...)`
+- `use` is for packages in the supported CADA surface; do not write `use Name;`
+  for top-level subprograms or top-level types
 
 ## What Is Left To Do
 

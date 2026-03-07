@@ -27,6 +27,7 @@ fn gnat_compiles_and_runs_repository_examples() {
         "13_private_package_helpers",
         "14_nested_block_locals",
         "15_float_and_character_literals",
+        "16_loop_control",
     ] {
         run_repository_example(stem);
     }
@@ -81,7 +82,7 @@ fn gnat_compiles_boolean_logic_program() {
         use Text_IO;
 
         fn Main() {
-            if ((true or false) and then not false) {
+            if ((true || false) && !false) {
                 Put_Line("ok");
             } else {
                 Put_Line("bad");
@@ -96,6 +97,37 @@ fn gnat_compiles_boolean_logic_program() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_use_without_import_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-use-only");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        use Text_IO;
+
+        fn Main() {
+            Put_Line("Hello");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "Hello\n");
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }
@@ -197,6 +229,7 @@ fn gnat_compiles_split_top_level_subprogram_dependencies() {
         r#"
         import Text_IO;
         use Text_IO;
+        import Adjust;
 
         fn Adjust(Integer Value) -> Integer {
             return Value + 1;
@@ -214,6 +247,48 @@ fn gnat_compiles_split_top_level_subprogram_dependencies() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_single_source_top_level_subprogram_chain_with_imports() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-top-level-chain");
+    let input_path = root.join("program.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Add;
+        import Show;
+
+        fn Add(Integer A, Integer B) -> Integer {
+            return A + B;
+        }
+
+        fn Show(Integer Value) {
+            Put_Line(Integer.image(Value));
+        }
+
+        fn Main() {
+            Show(Add(2, 3));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5");
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }
@@ -243,6 +318,7 @@ fn gnat_compiles_multi_file_program() {
         r#"
         import Text_IO;
         use Text_IO;
+        import Adjust;
 
         fn Main() {
             Put_Line(Integer.image(Adjust(2)));
@@ -256,6 +332,220 @@ fn gnat_compiles_multi_file_program() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_multi_file_package_program_with_import() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-package-dependency");
+    let math_path = root.join("math.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &math_path,
+        r#"
+        package body Math {
+            fn Add(Integer A, Integer B) -> Integer {
+                return A + B;
+            }
+        }
+        "#,
+    )
+    .expect("math input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Math;
+
+        fn Main() {
+            Put_Line(Integer.image(Math.Add(2, 3)));
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    run_cadar_split_many(&[&math_path, &main_path], &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_package_body_with_later_private_helper() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-later-private-helper");
+    let input_path = root.join("program.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Math;
+
+        package Math {
+            fn Add(Integer A, Integer B) -> Integer;
+        }
+
+        package body Math {
+            fn Add(Integer A, Integer B) -> Integer {
+                return Clamp(A) + Clamp(B);
+            }
+
+            fn Clamp(Integer Value) -> Integer {
+                return Value;
+            }
+        }
+
+        fn Main() {
+            Put_Line(Integer.image(Math.Add(2, 3)));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_package_body_with_later_type_and_object_declarations() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-later-package-decls");
+    let input_path = root.join("program.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Math;
+
+        package Math {
+            fn Get() -> Integer;
+        }
+
+        package body Math {
+            fn Get() -> Integer {
+                Hidden Value;
+                Value.X = Local_Count;
+                return Value.X;
+            }
+
+            Integer Local_Count = 7;
+
+            type Hidden = record {
+                Integer X;
+            };
+        }
+
+        fn Main() {
+            Put_Line(Integer.image(Math.Get()));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "7");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_contextually_disambiguated_overloads() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-contextual-overloads");
+    let input_path = root.join("program.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Tools;
+        use Tools;
+
+        package Tools {
+            fn Parse(String Text) -> Integer;
+            fn Parse(String Text) -> Boolean;
+            fn Show(Boolean Ready);
+        }
+
+        package body Tools {
+            fn Parse(String Text) -> Integer {
+                return 41;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            fn Show(Boolean Ready) {
+                if (Ready) {
+                    Put_Line("ready");
+                }
+            }
+        }
+
+        fn Main() {
+            Integer Count = Parse("42");
+            Integer Next = Parse("42") + 1;
+            Boolean Ready = Parse("ok");
+
+            Show(Parse("ok"));
+
+            if (not Parse("no") or Parse("yes")) {
+                Put_Line(Integer.image(Next));
+            }
+
+            if (Parse("42") == Count and Ready) {
+                Put_Line("match");
+            }
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "ready\n 42\nmatch\n"
+    );
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }

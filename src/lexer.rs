@@ -33,6 +33,8 @@ pub enum TokenKind {
     Invariant,
     Increases,
     Decreases,
+    Break,
+    Continue,
     Null,
     Then,
     And,
@@ -60,6 +62,8 @@ pub enum TokenKind {
     Assign,
     EqualEqual,
     BangEqual,
+    AndAnd,
+    OrOr,
     Plus,
     Minus,
     Star,
@@ -187,8 +191,29 @@ impl<'a> Lexer<'a> {
                         self.bump();
                         TokenKind::BangEqual
                     } else {
+                        TokenKind::Not
+                    }
+                }
+                b'&' => {
+                    self.bump();
+                    if self.peek() == Some(b'&') {
+                        self.bump();
+                        TokenKind::AndAnd
+                    } else {
                         return Err(Diagnostic::new(
-                            "unexpected `!`; use `!=` for inequality",
+                            "unexpected `&`; use `&&` for logical and",
+                            position,
+                        ));
+                    }
+                }
+                b'|' => {
+                    self.bump();
+                    if self.peek() == Some(b'|') {
+                        self.bump();
+                        TokenKind::OrOr
+                    } else {
+                        return Err(Diagnostic::new(
+                            "unexpected `|`; use `||` for logical or",
                             position,
                         ));
                     }
@@ -379,6 +404,8 @@ impl<'a> Lexer<'a> {
             "invariant" => TokenKind::Invariant,
             "increases" => TokenKind::Increases,
             "decreases" => TokenKind::Decreases,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
             "null" => TokenKind::Null,
             "then" => TokenKind::Then,
             "and" => TokenKind::And,

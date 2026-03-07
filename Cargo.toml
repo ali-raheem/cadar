@@ -1,6 +1,6 @@
 [package]
 name = "cadar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Ali Raheem"]
 description = "cada is a C-inspired syntax for Ada and Cadar is a transpiler"

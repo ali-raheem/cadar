@@ -242,7 +242,52 @@ fn split_units_writes_package_and_subprogram_files() {
 }
 
 #[test]
-fn split_units_adds_with_clause_for_called_top_level_subprogram() {
+fn split_units_reject_top_level_overloaded_subprograms() {
+    let root = temp_test_dir("split-overload-error");
+    let input_path = root.join("bundle.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        fn Parse(String Text) -> Integer {
+            return 1;
+        }
+
+        fn Parse(String Text) -> Boolean {
+            return true;
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "split-unit output does not support overloaded top-level subprograms like `Parse`"
+        ),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_rejects_called_top_level_subprogram_without_import() {
     let root = temp_test_dir("split-top-level-call");
     let input_path = root.join("bundle.cada");
     let out_dir = root.join("out");
@@ -252,6 +297,94 @@ fn split_units_adds_with_clause_for_called_top_level_subprogram() {
         r#"
         import Text_IO;
         use Text_IO;
+
+        fn Adjust(Integer Value) -> Integer {
+            return Value + 1;
+        }
+
+        fn Main() {
+            Put_Line(Integer.image(Adjust(2)));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("top-level subprogram `Adjust` is not visible; add `import Adjust;`"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_rejects_use_of_top_level_subprogram() {
+    let root = temp_test_dir("split-use-top-level-subprogram");
+    let input_path = root.join("bundle.cada");
+
+    fs::write(
+        &input_path,
+        r#"
+        use Adjust;
+
+        fn Adjust(Integer Value) -> Integer {
+            return Value + 1;
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "`use Adjust` is not valid because `Adjust` is a top-level subprogram; use `import Adjust;` and call it explicitly"
+        ),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_adds_with_clause_for_called_top_level_subprogram() {
+    let root = temp_test_dir("split-top-level-call-imported");
+    let input_path = root.join("bundle.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Adjust;
 
         fn Adjust(Integer Value) -> Integer {
             return Value + 1;
@@ -287,6 +420,46 @@ fn split_units_adds_with_clause_for_called_top_level_subprogram() {
 }
 
 #[test]
+fn split_units_adds_with_clause_for_use_without_import() {
+    let root = temp_test_dir("split-use-without-import");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        use Text_IO;
+
+        fn Main() {
+            Put_Line("Hello");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("main.adb")).expect("main body should exist"),
+        "with Text_IO;\nuse Text_IO;\n\nprocedure Main is\nbegin\n   Put_Line(\"Hello\");\nend Main;"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
 fn split_units_accept_multiple_input_files() {
     let root = temp_test_dir("split-multi-file");
     let adjust_path = root.join("adjust.cada");
@@ -307,6 +480,7 @@ fn split_units_accept_multiple_input_files() {
         r#"
         import Text_IO;
         use Text_IO;
+        import Adjust;
 
         fn Main() {
             Put_Line(Integer.image(Adjust(2)));
@@ -337,6 +511,117 @@ fn split_units_accept_multiple_input_files() {
     assert_eq!(
         fs::read_to_string(out_dir.join("main.adb")).expect("main body should exist"),
         "with Text_IO;\nuse Text_IO;\nwith Adjust;\n\nprocedure Main is\nbegin\n   Put_Line(Integer'Image(Adjust(2)));\nend Main;"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_rejects_referenced_package_without_import() {
+    let root = temp_test_dir("split-package-dependency");
+    let math_path = root.join("math.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &math_path,
+        r#"
+        package body Math {
+            fn Add(Integer A, Integer B) -> Integer {
+                return A + B;
+            }
+        }
+        "#,
+    )
+    .expect("math input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line(Integer.image(Math.Add(2, 3)));
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&math_path)
+        .arg(&main_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("package `Math` is not visible; add `import Math;` or `use Math;`"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_adds_with_clause_for_referenced_package_with_import() {
+    let root = temp_test_dir("split-package-dependency-imported");
+    let math_path = root.join("math.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &math_path,
+        r#"
+        package body Math {
+            fn Add(Integer A, Integer B) -> Integer {
+                return A + B;
+            }
+        }
+        "#,
+    )
+    .expect("math input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Math;
+
+        fn Main() {
+            Put_Line(Integer.image(Math.Add(2, 3)));
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&math_path)
+        .arg(&main_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("main.adb")).expect("main body should exist"),
+        "with Text_IO;\nuse Text_IO;\nwith Math;\n\nprocedure Main is\nbegin\n   Put_Line(Integer'Image(Math.Add(2, 3)));\nend Main;"
     );
 
     fs::remove_dir_all(root).expect("temp dir should be removed");

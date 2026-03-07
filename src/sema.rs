@@ -1,29 +1,78 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use crate::{
     ast::{
-        BinaryOp, BlockItem, CallArg, DependTarget, DependsContract, Expr, GlobalContract, Item,
-        LocalDecl, Name, Package, PackageItem, ParamMode, Program, RecordFieldInit, Statement,
-        StatementBlock, Subprogram, TypeDecl, UnaryOp,
+        BinaryOp, BlockItem, CallArg, CaseStatement, DependTarget, DependsContract, Expr,
+        GlobalContract, Item, LocalDecl, Name, Package, PackageItem, ParamMode, Program,
+        RecordFieldInit, Statement, StatementBlock, Subprogram, TypeDecl, UnaryOp,
     },
     diagnostic::{Diagnostic, IndexedDiagnostic, Position},
 };
 
 type SignatureIndex = HashMap<String, Vec<SubprogramSignature>>;
 
-pub fn validate_all(programs: &[Program]) -> Result<(), IndexedDiagnostic> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ExprKey {
+    source_index: usize,
+    position: Position,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SemanticInfo {
+    call_return_qualifications: HashMap<ExprKey, String>,
+}
+
+impl SemanticInfo {
+    fn record_call_return_qualification(
+        &mut self,
+        source_index: usize,
+        position: Position,
+        return_type: &str,
+    ) {
+        let key = ExprKey {
+            source_index,
+            position,
+        };
+        match self.call_return_qualifications.get(&key) {
+            Some(existing) => debug_assert_eq!(existing, return_type),
+            None => {
+                self.call_return_qualifications
+                    .insert(key, return_type.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn call_return_qualification(
+        &self,
+        source_index: usize,
+        position: Position,
+    ) -> Option<&str> {
+        self.call_return_qualifications
+            .get(&ExprKey {
+                source_index,
+                position,
+            })
+            .map(String::as_str)
+    }
+}
+
+pub fn validate_all(programs: &[Program]) -> Result<SemanticInfo, IndexedDiagnostic> {
     let summary = ProgramSummary::collect(programs)?;
     summary.validate_top_level_consistency()?;
     summary.validate_package_consistency()?;
+    let semantic_info = RefCell::new(SemanticInfo::default());
 
     for (source_index, program) in programs.iter().enumerate() {
         let source_context = SourceContext::from_program(program);
-        Validator::new(&summary, &source_context)
+        Validator::new(&summary, &source_context, source_index, &semantic_info)
             .validate_program(program)
             .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?;
     }
 
-    Ok(())
+    Ok(semantic_info.into_inner())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,10 +86,10 @@ impl SourceContext {
         let mut context = Self::default();
         for item in &program.items {
             match item {
-                Item::Import(name) => {
+                Item::Import { name, .. } => {
                     context.imports.insert(name.as_string());
                 }
-                Item::Use(name) => {
+                Item::Use { name, .. } => {
                     context.uses.insert(name.as_string());
                 }
                 Item::Subprogram(_) | Item::Type(_) | Item::Package(_) => {}
@@ -55,6 +104,20 @@ struct SignatureKey {
     name: String,
     params: Vec<(ParamMode, String)>,
     return_type: Option<String>,
+}
+
+impl SignatureKey {
+    fn from_subprogram(subprogram: &Subprogram) -> Self {
+        Self {
+            name: subprogram.name.clone(),
+            params: subprogram
+                .params
+                .iter()
+                .map(|param| (param.mode, param.ty.as_string()))
+                .collect(),
+            return_type: subprogram.return_type.as_ref().map(Name::as_string),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +218,9 @@ enum TypeKind {
     Record {
         fields: HashMap<String, String>,
     },
-    Enum,
+    Enum {
+        variants: Vec<String>,
+    },
     Range {
         base: String,
     },
@@ -179,6 +244,13 @@ struct ValueInfo {
     assignable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeReferenceVisibility {
+    Visible,
+    Private,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ExpectedTypeRef<'a> {
     ty: &'a str,
@@ -194,6 +266,8 @@ struct ProgramSummary {
     top_level_type_kinds: HashMap<String, TypeKind>,
     top_level_enum_literal_types: HashMap<String, Vec<String>>,
     packages: HashMap<String, PackageSummary>,
+    package_spec_types: HashMap<String, HashSet<String>>,
+    package_body_types: HashMap<String, HashSet<String>>,
     package_types: HashMap<String, HashSet<String>>,
     package_spec_values: HashMap<String, HashMap<String, ValueInfo>>,
     package_body_values: HashMap<String, HashMap<String, ValueInfo>>,
@@ -206,12 +280,25 @@ impl ProgramSummary {
     fn collect(programs: &[Program]) -> Result<Self, IndexedDiagnostic> {
         let mut summary = Self::default();
         let mut top_level_types = HashSet::new();
+        let mut top_level_subprogram_spellings = HashMap::new();
+        let mut top_level_type_spellings = HashMap::new();
+        let mut package_spellings = HashMap::new();
+        let mut package_subprogram_spellings = HashMap::new();
+        let mut package_value_spellings = HashMap::new();
+        let mut package_type_spellings = HashMap::new();
 
         for (source_index, program) in programs.iter().enumerate() {
             for item in &program.items {
                 match item {
-                    Item::Import(_) | Item::Use(_) => {}
+                    Item::Import { .. } | Item::Use { .. } => {}
                     Item::Subprogram(subprogram) => {
+                        register_case_distinct_spelling(
+                            &mut top_level_subprogram_spellings,
+                            &subprogram.name,
+                            subprogram.position,
+                            "top-level subprogram",
+                        )
+                        .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?;
                         let signature =
                             SubprogramSignature::from_subprogram(subprogram, source_index, None);
                         let scope = if subprogram.body.is_some() {
@@ -228,6 +315,12 @@ impl ProgramSummary {
                         .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?;
                     }
                     Item::Type(type_decl) => {
+                        validate_type_decl_case_distinct(
+                            type_decl,
+                            &mut top_level_type_spellings,
+                            "top-level",
+                        )
+                        .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?;
                         validate_type_decl(type_decl, &mut top_level_types, "top-level").map_err(
                             |diagnostic| IndexedDiagnostic::new(source_index, diagnostic),
                         )?;
@@ -244,9 +337,24 @@ impl ProgramSummary {
                     }
                     Item::Package(package) => {
                         let package_name = package.name.as_string();
+                        register_case_distinct_spelling(
+                            &mut package_spellings,
+                            &package_name,
+                            package.position,
+                            "top-level package",
+                        )
+                        .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?;
                         let entry = summary.packages.entry(package_name.clone()).or_default();
                         let package_types = summary
                             .package_types
+                            .entry(package_name.clone())
+                            .or_default();
+                        let package_spec_types = summary
+                            .package_spec_types
+                            .entry(package_name.clone())
+                            .or_default();
+                        let package_body_types = summary
+                            .package_body_types
                             .entry(package_name.clone())
                             .or_default();
                         let package_spec_values = summary
@@ -269,6 +377,15 @@ impl ProgramSummary {
                             .package_enum_literal_types
                             .entry(package_name.clone())
                             .or_default();
+                        let package_subprogram_spellings = package_subprogram_spellings
+                            .entry(package_name.clone())
+                            .or_default();
+                        let package_value_spellings = package_value_spellings
+                            .entry(package_name.clone())
+                            .or_default();
+                        let package_type_spellings = package_type_spellings
+                            .entry(package_name.clone())
+                            .or_default();
 
                         if package.is_body {
                             if entry.has_body {
@@ -286,8 +403,12 @@ impl ProgramSummary {
                                 source_index,
                                 PackageCollections {
                                     signatures: &mut entry.body_subprograms,
+                                    subprogram_spellings: package_subprogram_spellings,
                                     values: package_body_values,
+                                    value_spellings: package_value_spellings,
                                     type_names: package_types,
+                                    type_spellings: package_type_spellings,
+                                    section_type_names: package_body_types,
                                     enum_literals: package_enum_literals,
                                     type_kinds: package_type_kinds,
                                     enum_literal_types: package_enum_literal_types,
@@ -312,8 +433,12 @@ impl ProgramSummary {
                                 source_index,
                                 PackageCollections {
                                     signatures: &mut entry.spec_subprograms,
+                                    subprogram_spellings: package_subprogram_spellings,
                                     values: package_spec_values,
+                                    value_spellings: package_value_spellings,
                                     type_names: package_types,
+                                    type_spellings: package_type_spellings,
+                                    section_type_names: package_spec_types,
                                     enum_literals: package_enum_literals,
                                     type_kinds: package_type_kinds,
                                     enum_literal_types: package_enum_literal_types,
@@ -386,6 +511,7 @@ impl ProgramSummary {
 struct Scope {
     values: HashMap<String, ValueInfo>,
     subprograms: SignatureIndex,
+    loop_depth: usize,
 }
 
 impl Scope {
@@ -398,6 +524,12 @@ impl Scope {
                 assignable,
             },
         );
+        scope
+    }
+
+    fn enter_loop(&self) -> Self {
+        let mut scope = self.clone();
+        scope.loop_depth += 1;
         scope
     }
 
@@ -419,6 +551,19 @@ impl Scope {
         self.subprograms.extend(subprograms.clone());
     }
 
+    fn add_subprogram_signature(&mut self, signature: SubprogramSignature) {
+        let overloads = self
+            .subprograms
+            .entry(signature.key.name.clone())
+            .or_default();
+        if !overloads
+            .iter()
+            .any(|existing| same_call_target(existing, &signature))
+        {
+            overloads.push(signature);
+        }
+    }
+
     fn contains_value(&self, name: &str) -> bool {
         self.values.contains_key(name)
     }
@@ -434,29 +579,101 @@ impl Scope {
     fn subprogram_overloads(&self, name: &str) -> Option<&[SubprogramSignature]> {
         self.subprograms.get(name).map(Vec::as_slice)
     }
+
+    fn in_loop(&self) -> bool {
+        self.loop_depth > 0
+    }
 }
 
 struct Validator<'a> {
     summary: &'a ProgramSummary,
     source_context: &'a SourceContext,
+    source_index: usize,
+    semantic_info: &'a RefCell<SemanticInfo>,
 }
 
 impl<'a> Validator<'a> {
-    fn new(summary: &'a ProgramSummary, source_context: &'a SourceContext) -> Self {
+    fn new(
+        summary: &'a ProgramSummary,
+        source_context: &'a SourceContext,
+        source_index: usize,
+        semantic_info: &'a RefCell<SemanticInfo>,
+    ) -> Self {
         Self {
             summary,
             source_context,
+            source_index,
+            semantic_info,
+        }
+    }
+
+    fn record_call_return_qualification(&self, expr: &Expr, return_type: &str) {
+        if matches!(expr, Expr::Call { .. }) {
+            self.semantic_info
+                .borrow_mut()
+                .record_call_return_qualification(self.source_index, expr.position(), return_type);
         }
     }
 
     fn validate_program(&self, program: &Program) -> Result<(), Diagnostic> {
         for item in &program.items {
             match item {
+                Item::Import { name, position } => self.validate_import(name, *position)?,
+                Item::Use { name, position } => self.validate_use(name, *position)?,
                 Item::Subprogram(subprogram) => {
-                    self.validate_subprogram(subprogram, None, &Scope::default())?
+                    self.validate_subprogram(subprogram, None, false, &Scope::default())?
                 }
                 Item::Package(package) => self.validate_package(package)?,
-                Item::Import(_) | Item::Use(_) | Item::Type(_) => {}
+                Item::Type(type_decl) => {
+                    self.validate_type_decl_visibility(type_decl, None, false)?
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_import(&self, name: &Name, position: Position) -> Result<(), Diagnostic> {
+        if name.segments.len() == 1 && self.summary.top_level_types.contains(&name.segments[0]) {
+            return Err(Diagnostic::new(
+                format!(
+                    "`import {}` is not valid because `{}` is a top-level type, not a library unit",
+                    name.as_string(),
+                    name.as_string()
+                ),
+                position,
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_use(&self, name: &Name, position: Position) -> Result<(), Diagnostic> {
+        if name.segments.len() == 1 {
+            let identifier = &name.segments[0];
+            if self.summary.top_level_declarations.contains_key(identifier)
+                || self.summary.top_level_definitions.contains_key(identifier)
+            {
+                return Err(Diagnostic::new(
+                    format!(
+                        "`use {}` is not valid because `{}` is a top-level subprogram; use `import {};` and call it explicitly",
+                        name.as_string(),
+                        name.as_string(),
+                        name.as_string()
+                    ),
+                    position,
+                ));
+            }
+
+            if self.summary.top_level_types.contains(identifier) {
+                return Err(Diagnostic::new(
+                    format!(
+                        "`use {}` is not valid because `{}` is a top-level type, not a package",
+                        name.as_string(),
+                        name.as_string()
+                    ),
+                    position,
+                ));
             }
         }
 
@@ -475,12 +692,31 @@ impl<'a> Validator<'a> {
         for item in &package.items {
             match item {
                 PackageItem::Object(decl) => {
-                    self.validate_object_decl(decl, &scope, Some(&package_name))?;
+                    self.validate_object_decl(decl, &scope, Some(&package_name), package.is_body)?;
                 }
                 PackageItem::Subprogram(subprogram) => {
-                    self.validate_subprogram(subprogram, Some(&package_name), &scope)?;
+                    let allow_body_types_in_signature = if package.is_body {
+                        self.package_body_subprogram_uses_private_signature_types(
+                            &package_name,
+                            subprogram,
+                        )
+                    } else {
+                        false
+                    };
+                    self.validate_subprogram(
+                        subprogram,
+                        Some(&package_name),
+                        allow_body_types_in_signature,
+                        &scope,
+                    )?;
                 }
-                PackageItem::Type(_) => {}
+                PackageItem::Type(type_decl) => {
+                    self.validate_type_decl_visibility(
+                        type_decl,
+                        Some(&package_name),
+                        package.is_body,
+                    )?;
+                }
             }
         }
 
@@ -491,11 +727,20 @@ impl<'a> Validator<'a> {
         &self,
         subprogram: &Subprogram,
         current_package: Option<&str>,
+        allow_package_body_types_in_signature: bool,
         initial_scope: &Scope,
     ) -> Result<(), Diagnostic> {
         let mut scope = initial_scope.clone();
         let mut declared_names = HashSet::new();
+        let mut declared_name_spellings = HashMap::new();
         for param in &subprogram.params {
+            self.validate_type_reference_visible(
+                &param.ty,
+                current_package,
+                allow_package_body_types_in_signature,
+                "parameter type",
+                subprogram.position,
+            )?;
             if param.mode != ParamMode::In && param.default.is_some() {
                 return Err(Diagnostic::new(
                     "default values are only allowed for `in` parameters",
@@ -517,6 +762,12 @@ impl<'a> Validator<'a> {
                     current_package,
                 )?;
             }
+            register_case_distinct_spelling(
+                &mut declared_name_spellings,
+                &param.name,
+                subprogram.position,
+                "parameter",
+            )?;
             if !declared_names.insert(param.name.clone()) {
                 return Err(Diagnostic::new(
                     format!("duplicate parameter `{}`", param.name),
@@ -529,6 +780,22 @@ impl<'a> Validator<'a> {
                 param.mode != ParamMode::In,
             );
         }
+
+        if let Some(return_type) = &subprogram.return_type {
+            self.validate_type_reference_visible(
+                return_type,
+                current_package,
+                allow_package_body_types_in_signature,
+                "subprogram return type",
+                subprogram.position,
+            )?;
+        }
+
+        scope.add_subprogram_signature(SubprogramSignature::from_subprogram(
+            subprogram,
+            self.source_index,
+            current_package,
+        ));
 
         for require in &subprogram.requires {
             self.validate_contract_expr(
@@ -561,7 +828,18 @@ impl<'a> Validator<'a> {
         for item in &body.items {
             match item {
                 BlockItem::LocalDecl(decl) => {
-                    self.validate_object_decl(decl, &scope, current_package)?;
+                    self.validate_object_decl(
+                        decl,
+                        &scope,
+                        current_package,
+                        current_package.is_some(),
+                    )?;
+                    register_case_distinct_spelling(
+                        &mut declared_name_spellings,
+                        &decl.name,
+                        decl.position,
+                        "local declaration",
+                    )?;
                     if !declared_names.insert(decl.name.clone()) {
                         return Err(Diagnostic::new(
                             format!("duplicate local declaration `{}`", decl.name),
@@ -581,7 +859,144 @@ impl<'a> Validator<'a> {
             }
         }
 
+        if subprogram.return_type.is_some()
+            && !self.block_guarantees_return(&body.items, &scope, current_package)
+        {
+            return Err(Diagnostic::new(
+                format!(
+                    "function `{}` may complete without returning a value",
+                    subprogram.name
+                ),
+                subprogram.position,
+            ));
+        }
+
         Ok(())
+    }
+
+    fn block_guarantees_return(
+        &self,
+        items: &[BlockItem],
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> bool {
+        let mut scope = scope.clone();
+        for item in items {
+            match item {
+                BlockItem::LocalDecl(decl) => {
+                    scope.set_value(&decl.name, &decl.ty.as_string(), !decl.is_const);
+                }
+                BlockItem::Statement(statement) => {
+                    if self.statement_guarantees_return(statement, &scope, current_package) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn statement_block_guarantees_return(
+        &self,
+        block: &StatementBlock,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> bool {
+        self.block_guarantees_return(&block.items, scope, current_package)
+    }
+
+    fn statement_guarantees_return(
+        &self,
+        statement: &Statement,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> bool {
+        match statement {
+            Statement::Return { expr: Some(_), .. } => true,
+            Statement::Null { .. }
+            | Statement::Break { .. }
+            | Statement::Continue { .. }
+            | Statement::Assert { .. }
+            | Statement::Return { expr: None, .. }
+            | Statement::Assign { .. }
+            | Statement::Expr { .. }
+            | Statement::While { .. }
+            | Statement::For(_) => false,
+            Statement::If(if_statement) => {
+                self.statement_block_guarantees_return(
+                    &if_statement.then_branch,
+                    scope,
+                    current_package,
+                ) && if_statement.else_if_branches.iter().all(|branch| {
+                    self.statement_block_guarantees_return(&branch.body, scope, current_package)
+                }) && if_statement.else_branch.as_ref().is_some_and(|branch| {
+                    self.statement_block_guarantees_return(branch, scope, current_package)
+                })
+            }
+            Statement::Case(case_statement) => {
+                case_statement.arms.iter().all(|arm| {
+                    self.statement_block_guarantees_return(&arm.body, scope, current_package)
+                }) && (case_statement.else_arm.as_ref().is_some_and(|arm| {
+                    self.statement_block_guarantees_return(arm, scope, current_package)
+                }) || self.case_statement_is_exhaustive(
+                    case_statement,
+                    scope,
+                    current_package,
+                ))
+            }
+        }
+    }
+
+    fn case_statement_is_exhaustive(
+        &self,
+        case_statement: &CaseStatement,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> bool {
+        let Ok(InferredType::Known(case_type)) =
+            self.infer_expr_type(&case_statement.expr, scope, current_package)
+        else {
+            return false;
+        };
+
+        let Some(canonical_type) = self.canonical_type_name(&case_type, current_package) else {
+            return false;
+        };
+        let root_type = self.root_canonical_type_name(&canonical_type);
+        let Some(TypeKind::Enum { variants }) = self.lookup_type_kind(&root_type) else {
+            return false;
+        };
+        let root_context = current_package_for_canonical(&root_type);
+
+        let mut covered = HashSet::new();
+        for arm in &case_statement.arms {
+            for choice in &arm.choices {
+                let Ok(InferredType::Known(choice_type)) =
+                    self.infer_expr_type(choice, scope, current_package)
+                else {
+                    return false;
+                };
+                if !self.types_are_compatible_in_contexts(
+                    &root_type,
+                    root_context.as_deref(),
+                    &choice_type,
+                    current_package,
+                ) {
+                    return false;
+                }
+
+                let Some(name) = expr_to_name(choice) else {
+                    return false;
+                };
+                let Some(literal) = name.segments.last() else {
+                    return false;
+                };
+                covered.insert(literal.clone());
+            }
+        }
+
+        variants.iter().all(|variant| covered.contains(variant))
     }
 
     fn validate_object_decl(
@@ -589,7 +1004,16 @@ impl<'a> Validator<'a> {
         decl: &LocalDecl,
         scope: &Scope,
         current_package: Option<&str>,
+        allow_package_body_types: bool,
     ) -> Result<(), Diagnostic> {
+        self.validate_type_reference_visible(
+            &decl.ty,
+            current_package,
+            allow_package_body_types,
+            "object type",
+            decl.position,
+        )?;
+
         if let Some(initializer) = &decl.initializer {
             self.validate_expr(initializer, scope, current_package)?;
             self.validate_value_type(
@@ -607,6 +1031,228 @@ impl<'a> Validator<'a> {
         }
 
         Ok(())
+    }
+
+    fn validate_type_decl_visibility(
+        &self,
+        type_decl: &TypeDecl,
+        current_package: Option<&str>,
+        allow_package_body_types: bool,
+    ) -> Result<(), Diagnostic> {
+        match type_decl {
+            TypeDecl::Record(record) => {
+                for field in &record.fields {
+                    self.validate_type_reference_visible(
+                        &field.ty,
+                        current_package,
+                        allow_package_body_types,
+                        "record field type",
+                        record.position,
+                    )?;
+                }
+            }
+            TypeDecl::Range(range_type) => {
+                self.validate_type_reference_visible(
+                    &range_type.base,
+                    current_package,
+                    allow_package_body_types,
+                    "range base type",
+                    range_type.position,
+                )?;
+            }
+            TypeDecl::Array(array_type) => {
+                self.validate_type_reference_visible(
+                    &array_type.element_type,
+                    current_package,
+                    allow_package_body_types,
+                    "array element type",
+                    array_type.position,
+                )?;
+            }
+            TypeDecl::Enum(_) => {}
+        }
+
+        Ok(())
+    }
+
+    fn validate_type_reference_visible(
+        &self,
+        name: &Name,
+        current_package: Option<&str>,
+        allow_package_body_types: bool,
+        context: &str,
+        position: Position,
+    ) -> Result<(), Diagnostic> {
+        if let Some(package_name) = self.hidden_known_package(name, current_package) {
+            return Err(Diagnostic::new(
+                format!(
+                    "package `{package_name}` is not visible in {context}; add `import {package_name};` or `use {package_name};`"
+                ),
+                position,
+            ));
+        }
+        self.validate_unqualified_type_name_unambiguous(name, current_package, position)?;
+        match self.type_reference_visibility(name, current_package, allow_package_body_types) {
+            TypeReferenceVisibility::Visible | TypeReferenceVisibility::Unknown => Ok(()),
+            TypeReferenceVisibility::Private => Err(Diagnostic::new(
+                format!("type `{}` is not visible in {context}", name.as_string()),
+                position,
+            )),
+        }
+    }
+
+    fn type_reference_visibility(
+        &self,
+        name: &Name,
+        current_package: Option<&str>,
+        allow_package_body_types: bool,
+    ) -> TypeReferenceVisibility {
+        if name.segments.len() == 1 {
+            return self.unqualified_type_reference_visibility(
+                &name.segments[0],
+                current_package,
+                allow_package_body_types,
+            );
+        }
+
+        let Some((package_name, type_name)) = split_qualified_name(name) else {
+            return TypeReferenceVisibility::Unknown;
+        };
+
+        if current_package.is_some_and(|current_package| current_package == package_name) {
+            if self
+                .summary
+                .package_spec_types
+                .get(&package_name)
+                .is_some_and(|types| types.contains(&type_name))
+            {
+                return TypeReferenceVisibility::Visible;
+            }
+            if allow_package_body_types
+                && self
+                    .summary
+                    .package_body_types
+                    .get(&package_name)
+                    .is_some_and(|types| types.contains(&type_name))
+            {
+                return TypeReferenceVisibility::Visible;
+            }
+            if self
+                .summary
+                .package_body_types
+                .get(&package_name)
+                .is_some_and(|types| types.contains(&type_name))
+            {
+                return TypeReferenceVisibility::Private;
+            }
+            if self.summary.packages.contains_key(&package_name) {
+                return TypeReferenceVisibility::Private;
+            }
+
+            return TypeReferenceVisibility::Unknown;
+        }
+
+        if !self.is_visible_package_name(&package_name, current_package) {
+            return TypeReferenceVisibility::Unknown;
+        }
+
+        if self
+            .summary
+            .package_spec_types
+            .get(&package_name)
+            .is_some_and(|types| types.contains(&type_name))
+        {
+            TypeReferenceVisibility::Visible
+        } else if self.summary.packages.contains_key(&package_name) {
+            TypeReferenceVisibility::Private
+        } else {
+            TypeReferenceVisibility::Unknown
+        }
+    }
+
+    fn unqualified_type_reference_visibility(
+        &self,
+        name: &str,
+        current_package: Option<&str>,
+        allow_package_body_types: bool,
+    ) -> TypeReferenceVisibility {
+        if builtin_type_names().contains(&name) || self.summary.top_level_types.contains(name) {
+            return TypeReferenceVisibility::Visible;
+        }
+
+        if let Some(package_name) = current_package {
+            if self
+                .summary
+                .package_spec_types
+                .get(package_name)
+                .is_some_and(|types| types.contains(name))
+            {
+                return TypeReferenceVisibility::Visible;
+            }
+
+            if allow_package_body_types
+                && self
+                    .summary
+                    .package_body_types
+                    .get(package_name)
+                    .is_some_and(|types| types.contains(name))
+            {
+                return TypeReferenceVisibility::Visible;
+            }
+
+            if self
+                .summary
+                .package_body_types
+                .get(package_name)
+                .is_some_and(|types| types.contains(name))
+            {
+                return TypeReferenceVisibility::Private;
+            }
+        }
+
+        let mut public_matches = self.source_context.uses.iter().filter(|package_name| {
+            self.summary
+                .package_spec_types
+                .get(*package_name)
+                .is_some_and(|types| types.contains(name))
+        });
+
+        if public_matches.next().is_some() {
+            return if public_matches.next().is_none() {
+                TypeReferenceVisibility::Visible
+            } else {
+                TypeReferenceVisibility::Private
+            };
+        }
+
+        if self.source_context.uses.iter().any(|package_name| {
+            self.summary
+                .package_body_types
+                .get(package_name)
+                .is_some_and(|types| types.contains(name))
+        }) {
+            return TypeReferenceVisibility::Private;
+        }
+
+        TypeReferenceVisibility::Unknown
+    }
+
+    fn package_body_subprogram_uses_private_signature_types(
+        &self,
+        package_name: &str,
+        subprogram: &Subprogram,
+    ) -> bool {
+        let Some(package_summary) = self.summary.packages.get(package_name) else {
+            return false;
+        };
+        if !package_summary.has_spec {
+            return false;
+        }
+
+        !contains_signature(
+            &package_summary.spec_subprograms,
+            &SignatureKey::from_subprogram(subprogram),
+        )
     }
 
     fn package_scope(&self, package_name: &str, include_body_values: bool) -> Scope {
@@ -701,45 +1347,59 @@ impl<'a> Validator<'a> {
     ) -> Result<(), Diagnostic> {
         match statement {
             Statement::Null { .. } => Ok(()),
+            Statement::Break { position } => {
+                if scope.in_loop() {
+                    Ok(())
+                } else {
+                    Err(Diagnostic::new(
+                        "`break` is only valid inside loops",
+                        *position,
+                    ))
+                }
+            }
+            Statement::Continue { position } => {
+                if scope.in_loop() {
+                    Ok(())
+                } else {
+                    Err(Diagnostic::new(
+                        "`continue` is only valid inside loops",
+                        *position,
+                    ))
+                }
+            }
             Statement::Assert { expr, position } => {
                 self.validate_expr(expr, scope, current_package)?;
                 self.validate_boolean_expr(expr, "assertion", *position, scope, current_package)
             }
-            Statement::Return { expr, position } => {
-                self.validate_expr(expr, scope, current_package)?;
-                let Some(expected_return_type) = expected_return_type else {
-                    return Err(Diagnostic::new(
-                        "procedures cannot return a value",
+            Statement::Return { expr, position } => match (expr, expected_return_type) {
+                (Some(expr), Some(expected_return_type)) => {
+                    self.validate_expr(expr, scope, current_package)?;
+                    self.validate_value_type(
+                        expr,
+                        Some(&expected_return_type.as_string()),
+                        "return expression",
                         *position,
-                    ));
-                };
-                self.validate_value_type(
-                    expr,
-                    Some(&expected_return_type.as_string()),
-                    "return expression",
+                        scope,
+                        current_package,
+                    )
+                }
+                (Some(_), None) => Err(Diagnostic::new(
+                    "procedures cannot return a value",
                     *position,
-                    scope,
-                    current_package,
-                )
-            }
+                )),
+                (None, Some(_)) => Err(Diagnostic::new("functions must return a value", *position)),
+                (None, None) => Ok(()),
+            },
             Statement::Expr { expr, position } => {
-                self.validate_expr(expr, scope, current_package)?;
                 if !matches!(expr, Expr::Call { .. }) {
+                    self.validate_expr(expr, scope, current_package)?;
                     return Err(Diagnostic::new(
                         "only call expressions are allowed as standalone statements",
                         *position,
                     ));
                 }
-                if matches!(
-                    self.infer_expr_type(expr, scope, current_package)?,
-                    InferredType::Known(_)
-                ) {
-                    return Err(Diagnostic::new(
-                        "function calls cannot be used as standalone statements",
-                        *position,
-                    ));
-                }
-                Ok(())
+                self.validate_expr(expr, scope, current_package)?;
+                self.validate_standalone_call(expr, scope, current_package)
             }
             Statement::Assign {
                 target,
@@ -868,7 +1528,13 @@ impl<'a> Validator<'a> {
                         current_package,
                     )?;
                 }
-                self.validate_statement_block(body, expected_return_type, scope, current_package)
+                let loop_scope = scope.enter_loop();
+                self.validate_statement_block(
+                    body,
+                    expected_return_type,
+                    &loop_scope,
+                    current_package,
+                )
             }
             Statement::For(for_statement) => {
                 self.validate_expr(&for_statement.start, scope, current_package)?;
@@ -889,7 +1555,7 @@ impl<'a> Validator<'a> {
                     scope,
                     current_package,
                 )?;
-                let loop_scope = scope.with_value(
+                let loop_scope = scope.enter_loop().with_value(
                     &for_statement.iterator,
                     &for_statement.iterator_type.as_string(),
                     false,
@@ -933,6 +1599,7 @@ impl<'a> Validator<'a> {
     ) -> Result<(), Diagnostic> {
         let mut scope = scope.clone();
         let mut declared_names = HashSet::new();
+        let mut declared_name_spellings = HashMap::new();
         let mut saw_statement = false;
 
         for item in &block.items {
@@ -944,7 +1611,18 @@ impl<'a> Validator<'a> {
                             decl.position,
                         ));
                     }
-                    self.validate_object_decl(decl, &scope, current_package)?;
+                    self.validate_object_decl(
+                        decl,
+                        &scope,
+                        current_package,
+                        current_package.is_some(),
+                    )?;
+                    register_case_distinct_spelling(
+                        &mut declared_name_spellings,
+                        &decl.name,
+                        decl.position,
+                        "local declaration",
+                    )?;
                     if !declared_names.insert(decl.name.clone()) {
                         return Err(Diagnostic::new(
                             format!("duplicate local declaration `{}`", decl.name),
@@ -1034,6 +1712,17 @@ impl<'a> Validator<'a> {
         let Some(expected_type) = expected_type else {
             return Ok(());
         };
+        if self.validate_call_against_expected_type(
+            expr,
+            ExpectedTypeRef {
+                ty: expected_type,
+                context: current_package,
+            },
+            scope,
+            current_package,
+        )? {
+            return Ok(());
+        }
         match inferred {
             InferredType::Known(actual_type) => {
                 if self.types_are_compatible(expected_type, &actual_type, current_package) {
@@ -1065,6 +1754,17 @@ impl<'a> Validator<'a> {
         scope: &Scope,
         current_package: Option<&str>,
     ) -> Result<(), Diagnostic> {
+        if self.validate_call_against_expected_type(
+            expr,
+            ExpectedTypeRef {
+                ty: "Boolean",
+                context: current_package,
+            },
+            scope,
+            current_package,
+        )? {
+            return Ok(());
+        }
         let inferred = self.infer_value_type(expr, scope, current_package)?;
         match inferred {
             InferredType::Known(actual_type) => {
@@ -1513,6 +2213,187 @@ impl<'a> Validator<'a> {
         Ok(InferredType::Unknown)
     }
 
+    fn infer_expr_type_for_expected_context(
+        &self,
+        expr: &Expr,
+        expected: ExpectedTypeRef<'_>,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> Result<InferredType, Diagnostic> {
+        if let Some(return_type) =
+            self.resolve_call_return_type_matching_expected(expr, expected, scope, current_package)?
+        {
+            return Ok(InferredType::Known(return_type));
+        }
+
+        self.infer_expr_type(expr, scope, current_package)
+    }
+
+    fn infer_expr_type_for_numeric_context(
+        &self,
+        expr: &Expr,
+        preferred: Option<ExpectedTypeRef<'_>>,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> Result<InferredType, Diagnostic> {
+        if let Some(return_type) = self.resolve_call_return_type_in_numeric_context(
+            expr,
+            preferred,
+            scope,
+            current_package,
+        )? {
+            return Ok(InferredType::Known(return_type));
+        }
+
+        self.infer_expr_type(expr, scope, current_package)
+    }
+
+    fn resolve_call_return_type_matching_expected(
+        &self,
+        expr: &Expr,
+        expected: ExpectedTypeRef<'_>,
+        scope: &Scope,
+        actual_context: Option<&str>,
+    ) -> Result<Option<String>, Diagnostic> {
+        let Expr::Call { callee, args, .. } = expr else {
+            return Ok(None);
+        };
+
+        if self.is_image_attribute_call(callee, actual_context)
+            || self.is_visible_type_expr(callee, actual_context)
+        {
+            return Ok(None);
+        }
+
+        let compatible =
+            self.compatible_known_call_candidates(callee, args, scope, actual_context)?;
+        if compatible.is_empty() {
+            return Ok(None);
+        }
+        let needs_qualification = compatible.len() > 1;
+        let only_procedures = compatible
+            .iter()
+            .all(|candidate| candidate.key.return_type.is_none());
+        let matching = self.filter_candidates_by_expected_return_type(compatible, expected);
+
+        match matching.as_slice() {
+            [] if only_procedures => Err(Diagnostic::new(
+                "procedures do not produce a value",
+                expr.position(),
+            )),
+            [] => Err(Diagnostic::new(
+                format!(
+                    "no matching overload for `{}` with argument types ({}) and expected return type `{}`",
+                    display_callee(callee),
+                    self.render_call_argument_types(args, scope, actual_context)?,
+                    expected.ty
+                ),
+                expr.position(),
+            )),
+            [candidate] => {
+                if needs_qualification
+                    && let Some(return_type) = candidate.key.return_type.as_deref()
+                {
+                    self.record_call_return_qualification(expr, return_type);
+                }
+                Ok(candidate.key.return_type.clone())
+            }
+            _ => Err(Diagnostic::new(
+                format!(
+                    "call to `{}` is ambiguous between {}",
+                    display_callee(callee),
+                    render_subprogram_candidate_list(&matching)
+                ),
+                expr.position(),
+            )),
+        }
+    }
+
+    fn resolve_call_return_type_in_numeric_context(
+        &self,
+        expr: &Expr,
+        preferred: Option<ExpectedTypeRef<'_>>,
+        scope: &Scope,
+        actual_context: Option<&str>,
+    ) -> Result<Option<String>, Diagnostic> {
+        let Expr::Call { callee, args, .. } = expr else {
+            return Ok(None);
+        };
+
+        if self.is_image_attribute_call(callee, actual_context)
+            || self.is_visible_type_expr(callee, actual_context)
+        {
+            return Ok(None);
+        }
+
+        let compatible =
+            self.compatible_known_call_candidates(callee, args, scope, actual_context)?;
+        if compatible.is_empty() {
+            return Ok(None);
+        }
+        let needs_qualification = compatible.len() > 1;
+
+        let only_procedures = compatible
+            .iter()
+            .all(|candidate| candidate.key.return_type.is_none());
+        let numeric = compatible
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .key
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|return_type| {
+                        self.is_numeric_type(return_type, candidate.owner_package()) == Some(true)
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        if numeric.is_empty() {
+            if only_procedures {
+                return Err(Diagnostic::new(
+                    "procedures do not produce a value",
+                    expr.position(),
+                ));
+            }
+
+            return Err(Diagnostic::new(
+                format!(
+                    "no matching overload for `{}` with argument types ({}) in a numeric context",
+                    display_callee(callee),
+                    self.render_call_argument_types(args, scope, actual_context)?
+                ),
+                expr.position(),
+            ));
+        }
+
+        let matching = preferred
+            .map(|expected| {
+                self.filter_candidates_by_expected_return_type(numeric.clone(), expected)
+            })
+            .filter(|matches| !matches.is_empty())
+            .unwrap_or(numeric);
+
+        match matching.as_slice() {
+            [candidate] => {
+                if needs_qualification
+                    && let Some(return_type) = candidate.key.return_type.as_deref()
+                {
+                    self.record_call_return_qualification(expr, return_type);
+                }
+                Ok(candidate.key.return_type.clone())
+            }
+            _ => Err(Diagnostic::new(
+                format!(
+                    "call to `{}` is ambiguous between {}",
+                    display_callee(callee),
+                    render_subprogram_candidate_list(&matching)
+                ),
+                expr.position(),
+            )),
+        }
+    }
+
     fn infer_record_literal_type(
         &self,
         ty: &Name,
@@ -1543,6 +2424,8 @@ impl<'a> Validator<'a> {
                 position,
             ));
         }
+
+        self.validate_unqualified_type_name_unambiguous(ty, current_package, position)?;
 
         let Some(canonical_type) = self.canonical_type_name(&type_name, current_package) else {
             return Ok(InferredType::Known(type_name));
@@ -1597,7 +2480,20 @@ impl<'a> Validator<'a> {
         scope: &Scope,
         current_package: Option<&str>,
     ) -> Result<InferredType, Diagnostic> {
-        let operand = self.infer_expr_type(expr, scope, current_package)?;
+        let operand = match op {
+            UnaryOp::Negate => {
+                self.infer_expr_type_for_numeric_context(expr, None, scope, current_package)?
+            }
+            UnaryOp::Not => self.infer_expr_type_for_expected_context(
+                expr,
+                ExpectedTypeRef {
+                    ty: "Boolean",
+                    context: current_package,
+                },
+                scope,
+                current_package,
+            )?,
+        };
         match op {
             UnaryOp::Negate => {
                 self.ensure_numeric_operand(
@@ -1634,11 +2530,48 @@ impl<'a> Validator<'a> {
         scope: &Scope,
         current_package: Option<&str>,
     ) -> Result<InferredType, Diagnostic> {
-        let lhs_type = self.infer_expr_type(lhs, scope, current_package)?;
-        let rhs_type = self.infer_expr_type(rhs, scope, current_package)?;
-
         match op {
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                let raw_lhs = self.infer_expr_type(lhs, scope, current_package)?;
+                let raw_rhs = self.infer_expr_type(rhs, scope, current_package)?;
+                let lhs_type = match raw_lhs {
+                    InferredType::Unknown => self.infer_expr_type_for_numeric_context(
+                        lhs,
+                        match &raw_rhs {
+                            InferredType::Known(ty)
+                                if self.is_numeric_type(ty, current_package) == Some(true) =>
+                            {
+                                Some(ExpectedTypeRef {
+                                    ty,
+                                    context: current_package,
+                                })
+                            }
+                            _ => None,
+                        },
+                        scope,
+                        current_package,
+                    )?,
+                    _ => raw_lhs,
+                };
+                let rhs_type = match raw_rhs {
+                    InferredType::Unknown => self.infer_expr_type_for_numeric_context(
+                        rhs,
+                        match &lhs_type {
+                            InferredType::Known(ty)
+                                if self.is_numeric_type(ty, current_package) == Some(true) =>
+                            {
+                                Some(ExpectedTypeRef {
+                                    ty,
+                                    context: current_package,
+                                })
+                            }
+                            _ => None,
+                        },
+                        scope,
+                        current_package,
+                    )?,
+                    _ => raw_rhs,
+                };
                 self.ensure_numeric_operand(
                     &lhs_type,
                     position,
@@ -1665,6 +2598,24 @@ impl<'a> Validator<'a> {
                 })
             }
             BinaryOp::And | BinaryOp::ShortCircuitAnd | BinaryOp::Or | BinaryOp::ShortCircuitOr => {
+                let lhs_type = self.infer_expr_type_for_expected_context(
+                    lhs,
+                    ExpectedTypeRef {
+                        ty: "Boolean",
+                        context: current_package,
+                    },
+                    scope,
+                    current_package,
+                )?;
+                let rhs_type = self.infer_expr_type_for_expected_context(
+                    rhs,
+                    ExpectedTypeRef {
+                        ty: "Boolean",
+                        context: current_package,
+                    },
+                    scope,
+                    current_package,
+                )?;
                 self.ensure_boolean_operand(
                     &lhs_type,
                     position,
@@ -1680,26 +2631,144 @@ impl<'a> Validator<'a> {
                 Ok(InferredType::Known("Boolean".to_string()))
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
-                self.ensure_comparable_pair(
-                    &lhs_type,
-                    &rhs_type,
-                    position,
-                    binary_op_text(op),
-                    current_package,
-                )?;
-                Ok(InferredType::Known("Boolean".to_string()))
+                let raw_lhs = self.infer_expr_type(lhs, scope, current_package)?;
+                let raw_rhs = self.infer_expr_type(rhs, scope, current_package)?;
+                let lhs_type = match raw_lhs {
+                    InferredType::Unknown => self.infer_expr_type_for_expected_context(
+                        lhs,
+                        match &raw_rhs {
+                            InferredType::Known(ty) => ExpectedTypeRef {
+                                ty,
+                                context: current_package,
+                            },
+                            _ => {
+                                return self.finish_comparable_pair(
+                                    &raw_lhs,
+                                    &raw_rhs,
+                                    position,
+                                    op,
+                                    current_package,
+                                );
+                            }
+                        },
+                        scope,
+                        current_package,
+                    )?,
+                    _ => raw_lhs,
+                };
+                let rhs_type = match raw_rhs {
+                    InferredType::Unknown => self.infer_expr_type_for_expected_context(
+                        rhs,
+                        match &lhs_type {
+                            InferredType::Known(ty) => ExpectedTypeRef {
+                                ty,
+                                context: current_package,
+                            },
+                            _ => {
+                                return self.finish_comparable_pair(
+                                    &lhs_type,
+                                    &raw_rhs,
+                                    position,
+                                    op,
+                                    current_package,
+                                );
+                            }
+                        },
+                        scope,
+                        current_package,
+                    )?,
+                    _ => raw_rhs,
+                };
+                self.finish_comparable_pair(&lhs_type, &rhs_type, position, op, current_package)
             }
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                self.ensure_ordered_pair(
-                    &lhs_type,
-                    &rhs_type,
-                    position,
-                    binary_op_text(op),
-                    current_package,
-                )?;
-                Ok(InferredType::Known("Boolean".to_string()))
+                let raw_lhs = self.infer_expr_type(lhs, scope, current_package)?;
+                let raw_rhs = self.infer_expr_type(rhs, scope, current_package)?;
+                let lhs_type = match raw_lhs {
+                    InferredType::Unknown => self.infer_expr_type_for_expected_context(
+                        lhs,
+                        match &raw_rhs {
+                            InferredType::Known(ty) => ExpectedTypeRef {
+                                ty,
+                                context: current_package,
+                            },
+                            _ => {
+                                return self.finish_ordered_pair(
+                                    &raw_lhs,
+                                    &raw_rhs,
+                                    position,
+                                    op,
+                                    current_package,
+                                );
+                            }
+                        },
+                        scope,
+                        current_package,
+                    )?,
+                    _ => raw_lhs,
+                };
+                let rhs_type = match raw_rhs {
+                    InferredType::Unknown => self.infer_expr_type_for_expected_context(
+                        rhs,
+                        match &lhs_type {
+                            InferredType::Known(ty) => ExpectedTypeRef {
+                                ty,
+                                context: current_package,
+                            },
+                            _ => {
+                                return self.finish_ordered_pair(
+                                    &lhs_type,
+                                    &raw_rhs,
+                                    position,
+                                    op,
+                                    current_package,
+                                );
+                            }
+                        },
+                        scope,
+                        current_package,
+                    )?,
+                    _ => raw_rhs,
+                };
+                self.finish_ordered_pair(&lhs_type, &rhs_type, position, op, current_package)
             }
         }
+    }
+
+    fn finish_comparable_pair(
+        &self,
+        lhs_type: &InferredType,
+        rhs_type: &InferredType,
+        position: Position,
+        op: BinaryOp,
+        current_package: Option<&str>,
+    ) -> Result<InferredType, Diagnostic> {
+        self.ensure_comparable_pair(
+            lhs_type,
+            rhs_type,
+            position,
+            binary_op_text(op),
+            current_package,
+        )?;
+        Ok(InferredType::Known("Boolean".to_string()))
+    }
+
+    fn finish_ordered_pair(
+        &self,
+        lhs_type: &InferredType,
+        rhs_type: &InferredType,
+        position: Position,
+        op: BinaryOp,
+        current_package: Option<&str>,
+    ) -> Result<InferredType, Diagnostic> {
+        self.ensure_ordered_pair(
+            lhs_type,
+            rhs_type,
+            position,
+            binary_op_text(op),
+            current_package,
+        )?;
+        Ok(InferredType::Known("Boolean".to_string()))
     }
 
     fn ensure_numeric_operand(
@@ -1871,6 +2940,20 @@ impl<'a> Validator<'a> {
             | Expr::Character { .. }
             | Expr::String { .. } => Ok(()),
             Expr::Name { name, position } => {
+                if let Some(package_name) = self.hidden_known_package(name, current_package) {
+                    return Err(Diagnostic::new(
+                        format!(
+                            "package `{package_name}` is not visible; add `import {package_name};` or `use {package_name};`"
+                        ),
+                        *position,
+                    ));
+                }
+                self.validate_unqualified_value_name_unambiguous(
+                    name,
+                    scope,
+                    current_package,
+                    *position,
+                )?;
                 if self.is_visible_value_name(name, scope, current_package) {
                     Ok(())
                 } else {
@@ -1951,41 +3034,11 @@ impl<'a> Validator<'a> {
             ));
         }
 
-        let candidates = self.resolve_call_candidates(callee, scope, current_package);
-        if !candidates.is_empty() {
-            let matching: Vec<_> = candidates
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.required_arity() <= args.len() && args.len() <= candidate.arity()
-                })
-                .collect();
-            if matching.is_empty() {
-                let arg_count = args.len();
-                let suffix = if arg_count == 1 { "" } else { "s" };
-                return Err(Diagnostic::new(
-                    format!(
-                        "`{}` does not accept {arg_count} argument{suffix}",
-                        display_callee(callee)
-                    ),
-                    callee.position(),
-                ));
-            }
-
-            if !self
-                .filter_compatible_call_candidates(matching, args, scope, current_package)?
-                .is_empty()
-            {
-                return Ok(());
-            }
-
-            return Err(Diagnostic::new(
-                format!(
-                    "no matching overload for `{}` with argument types ({})",
-                    display_callee(callee),
-                    self.render_call_argument_types(args, scope, current_package)?
-                ),
-                callee.position(),
-            ));
+        if !self
+            .compatible_known_call_candidates(callee, args, scope, current_package)?
+            .is_empty()
+        {
+            return Ok(());
         }
 
         if self.is_visible_type_expr(callee, current_package) {
@@ -1999,6 +3052,18 @@ impl<'a> Validator<'a> {
                     display_callee(callee)
                 ),
                 callee.position(),
+            ));
+        }
+
+        if let Expr::Name { name, position } = callee
+            && let Some(subprogram_name) =
+                self.hidden_known_top_level_subprogram(name, scope, current_package)
+        {
+            return Err(Diagnostic::new(
+                format!(
+                    "top-level subprogram `{subprogram_name}` is not visible; add `import {subprogram_name};`"
+                ),
+                *position,
             ));
         }
 
@@ -2031,6 +3096,227 @@ impl<'a> Validator<'a> {
         }
 
         Ok(())
+    }
+
+    fn validate_standalone_call(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> Result<(), Diagnostic> {
+        let Expr::Call { callee, args, .. } = expr else {
+            return Ok(());
+        };
+
+        if self.is_image_attribute_call(callee, current_package)
+            || self.is_visible_type_expr(callee, current_package)
+        {
+            return Err(Diagnostic::new(
+                "function calls cannot be used as standalone statements",
+                expr.position(),
+            ));
+        }
+
+        let compatible =
+            self.compatible_known_call_candidates(callee, args, scope, current_package)?;
+        if compatible.is_empty() {
+            return Ok(());
+        }
+
+        let procedures = compatible
+            .into_iter()
+            .filter(|candidate| candidate.key.return_type.is_none())
+            .collect::<Vec<_>>();
+        match procedures.len() {
+            0 => Err(Diagnostic::new(
+                "function calls cannot be used as standalone statements",
+                expr.position(),
+            )),
+            1 => Ok(()),
+            _ => Err(Diagnostic::new(
+                format!(
+                    "call to `{}` is ambiguous between {}",
+                    display_callee(callee),
+                    render_subprogram_candidate_list(&procedures)
+                ),
+                expr.position(),
+            )),
+        }
+    }
+
+    fn validate_call_against_expected_type(
+        &self,
+        expr: &Expr,
+        expected: ExpectedTypeRef<'_>,
+        scope: &Scope,
+        actual_context: Option<&str>,
+    ) -> Result<bool, Diagnostic> {
+        let Expr::Call { callee, args, .. } = expr else {
+            return Ok(false);
+        };
+
+        if self.is_image_attribute_call(callee, actual_context)
+            || self.is_visible_type_expr(callee, actual_context)
+        {
+            return Ok(false);
+        }
+
+        let compatible =
+            self.compatible_known_call_candidates(callee, args, scope, actual_context)?;
+        if compatible.is_empty() {
+            return Ok(false);
+        }
+        let needs_qualification = compatible.len() > 1;
+        let only_procedures = compatible
+            .iter()
+            .all(|candidate| candidate.key.return_type.is_none());
+        let matching = self.filter_candidates_by_expected_return_type(compatible, expected);
+
+        match matching.len() {
+            0 => {
+                if only_procedures {
+                    return Err(Diagnostic::new(
+                        "procedures do not produce a value",
+                        expr.position(),
+                    ));
+                }
+
+                Err(Diagnostic::new(
+                    format!(
+                        "no matching overload for `{}` with argument types ({}) and expected return type `{}`",
+                        display_callee(callee),
+                        self.render_call_argument_types(args, scope, actual_context)?,
+                        expected.ty
+                    ),
+                    expr.position(),
+                ))
+            }
+            1 => {
+                if needs_qualification
+                    && let Some(return_type) = matching[0].key.return_type.as_deref()
+                {
+                    self.record_call_return_qualification(expr, return_type);
+                }
+                Ok(true)
+            }
+            _ => Err(Diagnostic::new(
+                format!(
+                    "call to `{}` is ambiguous between {}",
+                    display_callee(callee),
+                    render_subprogram_candidate_list(&matching)
+                ),
+                expr.position(),
+            )),
+        }
+    }
+
+    fn filter_candidates_by_expected_return_type<'b>(
+        &self,
+        candidates: Vec<&'b SubprogramSignature>,
+        expected: ExpectedTypeRef<'_>,
+    ) -> Vec<&'b SubprogramSignature> {
+        let exact = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate
+                    .key
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|return_type| {
+                        self.return_types_match_exactly(
+                            expected.ty,
+                            expected.context,
+                            return_type,
+                            candidate.owner_package(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            return exact;
+        }
+
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .key
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|return_type| {
+                        self.types_are_compatible_in_contexts(
+                            expected.ty,
+                            expected.context,
+                            return_type,
+                            candidate.owner_package(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn return_types_match_exactly(
+        &self,
+        expected_type: &str,
+        expected_context: Option<&str>,
+        actual_type: &str,
+        actual_context: Option<&str>,
+    ) -> bool {
+        let Some(expected_canonical) = self.canonical_type_name(expected_type, expected_context)
+        else {
+            return expected_type == actual_type;
+        };
+        let Some(actual_canonical) = self.canonical_type_name(actual_type, actual_context) else {
+            return expected_type == actual_type;
+        };
+        expected_canonical == actual_canonical
+    }
+
+    fn compatible_known_call_candidates<'b>(
+        &'b self,
+        callee: &Expr,
+        args: &[CallArg],
+        scope: &'b Scope,
+        current_package: Option<&str>,
+    ) -> Result<Vec<&'b SubprogramSignature>, Diagnostic> {
+        let candidates = self.resolve_call_candidates(callee, scope, current_package);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let matching: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.required_arity() <= args.len() && args.len() <= candidate.arity()
+            })
+            .collect();
+        if matching.is_empty() {
+            let arg_count = args.len();
+            let suffix = if arg_count == 1 { "" } else { "s" };
+            return Err(Diagnostic::new(
+                format!(
+                    "`{}` does not accept {arg_count} argument{suffix}",
+                    display_callee(callee)
+                ),
+                callee.position(),
+            ));
+        }
+
+        let compatible =
+            self.filter_compatible_call_candidates(matching, args, scope, current_package)?;
+        if compatible.is_empty() {
+            return Err(Diagnostic::new(
+                format!(
+                    "no matching overload for `{}` with argument types ({})",
+                    display_callee(callee),
+                    self.render_call_argument_types(args, scope, current_package)?
+                ),
+                callee.position(),
+            ));
+        }
+
+        Ok(compatible)
     }
 
     fn validate_call_arg_syntax(&self, args: &[CallArg]) -> Result<(), Diagnostic> {
@@ -2081,14 +3367,16 @@ impl<'a> Validator<'a> {
                         package.visible_subprograms().get(&name.segments[0]),
                     );
                 }
-                extend_candidates(
-                    &mut candidates,
-                    self.summary.top_level_declarations.get(&name.segments[0]),
-                );
-                extend_candidates(
-                    &mut candidates,
-                    self.summary.top_level_definitions.get(&name.segments[0]),
-                );
+                if self.is_visible_top_level_subprogram_name(&name.segments[0]) {
+                    extend_candidates(
+                        &mut candidates,
+                        self.summary.top_level_declarations.get(&name.segments[0]),
+                    );
+                    extend_candidates(
+                        &mut candidates,
+                        self.summary.top_level_definitions.get(&name.segments[0]),
+                    );
+                }
                 for used_package in self.visible_used_internal_packages() {
                     extend_candidates(
                         &mut candidates,
@@ -2106,6 +3394,9 @@ impl<'a> Validator<'a> {
                     && let Some(subprograms) = scope.subprogram_overloads(member)
                 {
                     candidates.extend(subprograms.iter());
+                }
+                if !self.is_visible_package_path(&package_name, current_package) {
+                    return candidates;
                 }
                 let Some(package) = self.summary.packages.get(&package_name.as_string()) else {
                     return candidates;
@@ -2126,6 +3417,12 @@ impl<'a> Validator<'a> {
     ) -> Result<(), Diagnostic> {
         match target {
             Expr::Name { name, .. } => {
+                self.validate_unqualified_value_name_unambiguous(
+                    name,
+                    scope,
+                    current_package,
+                    position,
+                )?;
                 let Some(first_segment) = name.segments.first() else {
                     return Ok(());
                 };
@@ -2234,6 +3531,21 @@ impl<'a> Validator<'a> {
     ) -> Result<(), Diagnostic> {
         match base {
             Expr::Name { name, position } => {
+                if let Some(package_name) = self.hidden_known_package(name, current_package) {
+                    return Err(Diagnostic::new(
+                        format!(
+                            "package `{package_name}` is not visible; add `import {package_name};` or `use {package_name};`"
+                        ),
+                        *position,
+                    ));
+                }
+                self.validate_unqualified_value_name_unambiguous(
+                    name,
+                    scope,
+                    current_package,
+                    *position,
+                )?;
+                self.validate_unqualified_type_name_unambiguous(name, current_package, *position)?;
                 if self.is_visible_value_name(name, scope, current_package)
                     || self.is_visible_package_path(name, current_package)
                     || self.is_visible_type_path(name, current_package)
@@ -2245,11 +3557,21 @@ impl<'a> Validator<'a> {
                 }
             }
             Expr::Member { .. } => {
-                if let Some(name) = expr_to_name(base)
-                    && (self.is_visible_package_path(&name, current_package)
-                        || self.is_visible_type_path(&name, current_package))
-                {
-                    return Ok(());
+                if let Some(name) = expr_to_name(base) {
+                    if let Some(package_name) = self.hidden_known_package(&name, current_package) {
+                        return Err(Diagnostic::new(
+                            format!(
+                                "package `{package_name}` is not visible; add `import {package_name};` or `use {package_name};`"
+                            ),
+                            base.position(),
+                        ));
+                    }
+
+                    if self.is_visible_package_path(&name, current_package)
+                        || self.is_visible_type_path(&name, current_package)
+                    {
+                        return Ok(());
+                    }
                 }
 
                 self.validate_expr(base, scope, current_package)
@@ -2265,7 +3587,15 @@ impl<'a> Validator<'a> {
         current_package: Option<&str>,
     ) -> Result<(), Diagnostic> {
         match callee {
-            Expr::Name { .. } => Ok(()),
+            Expr::Name { name, position } => {
+                self.validate_unqualified_value_name_unambiguous(
+                    name,
+                    scope,
+                    current_package,
+                    *position,
+                )?;
+                self.validate_unqualified_type_name_unambiguous(name, current_package, *position)
+            }
             Expr::Member { base, .. } => self.validate_member_base(base, scope, current_package),
             _ => self.validate_expr(callee, scope, current_package),
         }
@@ -2299,9 +3629,11 @@ impl<'a> Validator<'a> {
             return true;
         }
 
-        self.summary.packages.contains_key(name)
-            || self.source_context.imports.contains(name)
-            || self.source_context.uses.contains(name)
+        self.source_context.imports.contains(name) || self.source_context.uses.contains(name)
+    }
+
+    fn is_visible_top_level_subprogram_name(&self, name: &str) -> bool {
+        self.source_context.imports.contains(name)
     }
 
     fn is_visible_type_name(&self, name: &str, current_package: Option<&str>) -> bool {
@@ -2329,10 +3661,77 @@ impl<'a> Validator<'a> {
         let Some((package_name, type_name)) = split_qualified_name(name) else {
             return false;
         };
+        if current_package.is_some_and(|current_package| current_package == package_name) {
+            return self
+                .summary
+                .package_types
+                .get(&package_name)
+                .is_some_and(|types| types.contains(&type_name));
+        }
+        if !self.is_visible_package_name(&package_name, current_package) {
+            return false;
+        }
         self.summary
-            .package_types
+            .package_spec_types
             .get(&package_name)
             .is_some_and(|types| types.contains(&type_name))
+    }
+
+    fn hidden_known_package(&self, name: &Name, current_package: Option<&str>) -> Option<String> {
+        for length in (1..=name.segments.len()).rev() {
+            let package_name = name.segments[..length].join(".");
+            if self.summary.packages.contains_key(&package_name)
+                && !self.is_visible_package_name(&package_name, current_package)
+            {
+                return Some(package_name);
+            }
+        }
+
+        None
+    }
+
+    fn hidden_known_top_level_subprogram(
+        &self,
+        name: &Name,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> Option<String> {
+        if name.segments.len() != 1 {
+            return None;
+        }
+
+        let identifier = &name.segments[0];
+        if scope.subprogram_overloads(identifier).is_some() {
+            return None;
+        }
+
+        if current_package
+            .and_then(|package_name| self.summary.packages.get(package_name))
+            .and_then(|package| package.visible_subprograms().get(identifier))
+            .is_some()
+        {
+            return None;
+        }
+
+        if self
+            .visible_used_internal_packages()
+            .into_iter()
+            .any(|package| package.visible_subprograms().contains_key(identifier))
+        {
+            return None;
+        }
+
+        if self.is_visible_top_level_subprogram_name(identifier) {
+            return None;
+        }
+
+        if self.summary.top_level_declarations.contains_key(identifier)
+            || self.summary.top_level_definitions.contains_key(identifier)
+        {
+            Some(identifier.clone())
+        } else {
+            None
+        }
     }
 
     fn is_visible_type_expr(&self, expr: &Expr, current_package: Option<&str>) -> bool {
@@ -2506,6 +3905,18 @@ impl<'a> Validator<'a> {
         scope: &Scope,
         actual_context: Option<&str>,
     ) -> Result<bool, Diagnostic> {
+        if self.validate_call_against_expected_type(
+            arg,
+            ExpectedTypeRef {
+                ty: expected_type,
+                context: expected_context,
+            },
+            scope,
+            actual_context,
+        )? {
+            return Ok(true);
+        }
+
         match self.infer_value_type(arg, scope, actual_context)? {
             InferredType::Known(actual_type) => Ok(self.types_are_compatible_in_contexts(
                 expected_type,
@@ -2616,6 +4027,9 @@ impl<'a> Validator<'a> {
         scope: &Scope,
         actual_context: Option<&str>,
     ) -> Result<(), Diagnostic> {
+        if self.validate_call_against_expected_type(expr, expected, scope, actual_context)? {
+            return Ok(());
+        }
         match self.infer_value_type(expr, scope, actual_context)? {
             InferredType::Known(actual_type) => {
                 if self.types_are_compatible_in_contexts(
@@ -2847,9 +4261,17 @@ impl<'a> Validator<'a> {
         }
 
         if let Some((package_name, type_name)) = split_qualified_type_str(ty) {
+            if current_package.is_some_and(|current_package| current_package == package_name) {
+                return self
+                    .summary
+                    .package_types
+                    .get(&package_name)
+                    .is_some_and(|types| types.contains(&type_name))
+                    .then(|| format!("{package_name}.{type_name}"));
+            }
             return self
                 .summary
-                .package_types
+                .package_spec_types
                 .get(&package_name)
                 .is_some_and(|types| types.contains(&type_name))
                 .then(|| format!("{package_name}.{type_name}"));
@@ -2873,7 +4295,7 @@ impl<'a> Validator<'a> {
         for package_name in &self.source_context.uses {
             if self
                 .summary
-                .package_types
+                .package_spec_types
                 .get(package_name)
                 .is_some_and(|types| types.contains(ty))
             {
@@ -2947,7 +4369,7 @@ impl<'a> Validator<'a> {
         Some(match root.as_str() {
             "Boolean" | "Character" | "Integer" => true,
             "Float" | "String" => false,
-            _ => matches!(self.lookup_type_kind(&root), Some(TypeKind::Enum)),
+            _ => matches!(self.lookup_type_kind(&root), Some(TypeKind::Enum { .. })),
         })
     }
 
@@ -2960,7 +4382,7 @@ impl<'a> Validator<'a> {
         let root = self.root_canonical_type_name(&canonical);
         Some(match root.as_str() {
             "Boolean" | "Character" | "Integer" | "Float" | "String" => true,
-            _ => matches!(self.lookup_type_kind(&root), Some(TypeKind::Enum)),
+            _ => matches!(self.lookup_type_kind(&root), Some(TypeKind::Enum { .. })),
         })
     }
 
@@ -3022,7 +4444,7 @@ impl<'a> Validator<'a> {
         self.source_context
             .uses
             .iter()
-            .filter_map(|name| self.summary.package_types.get(name))
+            .filter_map(|name| self.summary.package_spec_types.get(name))
             .collect()
     }
 
@@ -3033,12 +4455,127 @@ impl<'a> Validator<'a> {
             .filter_map(|name| self.summary.package_enum_literals.get(name))
             .collect()
     }
+
+    fn validate_unqualified_value_name_unambiguous(
+        &self,
+        name: &Name,
+        scope: &Scope,
+        current_package: Option<&str>,
+        position: Position,
+    ) -> Result<(), Diagnostic> {
+        if name.segments.len() != 1 {
+            return Ok(());
+        }
+
+        let identifier = &name.segments[0];
+        if scope.contains_value(identifier) {
+            return Ok(());
+        }
+
+        let value_packages = self.used_package_value_packages(identifier);
+        if value_packages.len() > 1 {
+            return Err(Diagnostic::new(
+                format!(
+                    "identifier `{identifier}` is ambiguous via `use` of packages {}",
+                    render_name_list(&value_packages)
+                ),
+                position,
+            ));
+        }
+
+        if value_packages.is_empty() {
+            let enum_types = self.visible_enum_literal_types(identifier, current_package);
+            if enum_types.len() > 1 {
+                return Err(Diagnostic::new(
+                    format!(
+                        "enum literal `{identifier}` is ambiguous between types {}",
+                        render_name_list(&enum_types)
+                    ),
+                    position,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_unqualified_type_name_unambiguous(
+        &self,
+        name: &Name,
+        current_package: Option<&str>,
+        position: Position,
+    ) -> Result<(), Diagnostic> {
+        if name.segments.len() != 1 {
+            return Ok(());
+        }
+
+        let type_name = &name.segments[0];
+        if builtin_type_names().contains(&type_name.as_str())
+            || self.summary.top_level_types.contains(type_name)
+            || current_package
+                .and_then(|package| self.summary.package_types.get(package))
+                .is_some_and(|types| types.contains(type_name))
+        {
+            return Ok(());
+        }
+
+        let package_matches = self.used_package_type_packages(type_name);
+        if package_matches.len() > 1 {
+            return Err(Diagnostic::new(
+                format!(
+                    "type `{type_name}` is ambiguous via `use` of packages {}",
+                    render_name_list(&package_matches)
+                ),
+                position,
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn used_package_value_packages(&self, value_name: &str) -> Vec<String> {
+        let mut packages = self
+            .source_context
+            .uses
+            .iter()
+            .filter(|package_name| {
+                self.package_public_value_info(package_name, value_name)
+                    .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        packages.sort();
+        packages.dedup();
+        packages
+    }
+
+    fn used_package_type_packages(&self, type_name: &str) -> Vec<String> {
+        let mut packages = self
+            .source_context
+            .uses
+            .iter()
+            .filter(|package_name| {
+                self.summary
+                    .package_spec_types
+                    .get(*package_name)
+                    .is_some_and(|types| types.contains(type_name))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        packages.sort();
+        packages.dedup();
+        packages
+    }
 }
 
 struct PackageCollections<'a> {
     signatures: &'a mut SignatureIndex,
+    subprogram_spellings: &'a mut HashMap<String, String>,
     values: &'a mut HashMap<String, ValueInfo>,
+    value_spellings: &'a mut HashMap<String, String>,
     type_names: &'a mut HashSet<String>,
+    type_spellings: &'a mut HashMap<String, String>,
+    section_type_names: &'a mut HashSet<String>,
     enum_literals: &'a mut HashSet<String>,
     type_kinds: &'a mut HashMap<String, TypeKind>,
     enum_literal_types: &'a mut HashMap<String, Vec<String>>,
@@ -3058,8 +4595,12 @@ fn collect_package_items(
 
     let PackageCollections {
         signatures,
+        subprogram_spellings,
         values,
+        value_spellings,
         type_names,
+        type_spellings,
+        section_type_names,
         enum_literals,
         type_kinds,
         enum_literal_types,
@@ -3068,6 +4609,12 @@ fn collect_package_items(
     for item in &package.items {
         match item {
             PackageItem::Subprogram(subprogram) => {
+                register_case_distinct_spelling(
+                    subprogram_spellings,
+                    &subprogram.name,
+                    subprogram.position,
+                    &format!("subprogram in {scope_name}"),
+                )?;
                 insert_signature(
                     signatures,
                     SubprogramSignature::from_subprogram(
@@ -3080,11 +4627,19 @@ fn collect_package_items(
                 )?;
             }
             PackageItem::Type(type_decl) => {
+                validate_type_decl_case_distinct(type_decl, type_spellings, &scope_name)?;
                 validate_type_decl(type_decl, type_names, &scope_name)?;
+                collect_type_names(type_decl, section_type_names);
                 collect_type_symbols(type_decl, type_names, enum_literals);
                 collect_type_metadata(type_decl, type_kinds, enum_literal_types);
             }
             PackageItem::Object(decl) => {
+                register_case_distinct_spelling(
+                    value_spellings,
+                    &decl.name,
+                    decl.position,
+                    &format!("object in {scope_name}"),
+                )?;
                 if values
                     .insert(
                         decl.name.clone(),
@@ -3176,12 +4731,115 @@ fn validate_type_decl(
     Ok(())
 }
 
+fn validate_type_decl_case_distinct(
+    type_decl: &TypeDecl,
+    seen_spellings: &mut HashMap<String, String>,
+    scope_name: &str,
+) -> Result<(), Diagnostic> {
+    match type_decl {
+        TypeDecl::Record(record) => {
+            register_case_distinct_spelling(
+                seen_spellings,
+                &record.name,
+                record.position,
+                &format!("type in {scope_name}"),
+            )?;
+
+            let mut field_spellings = HashMap::new();
+            for field in &record.fields {
+                register_case_distinct_spelling(
+                    &mut field_spellings,
+                    &field.name,
+                    record.position,
+                    &format!("field of record `{}`", record.name),
+                )?;
+            }
+        }
+        TypeDecl::Enum(enum_type) => {
+            register_case_distinct_spelling(
+                seen_spellings,
+                &enum_type.name,
+                enum_type.position,
+                &format!("type in {scope_name}"),
+            )?;
+
+            let mut variant_spellings = HashMap::new();
+            for variant in &enum_type.variants {
+                register_case_distinct_spelling(
+                    &mut variant_spellings,
+                    variant,
+                    enum_type.position,
+                    &format!("variant of enum `{}`", enum_type.name),
+                )?;
+            }
+        }
+        TypeDecl::Range(range_type) => {
+            register_case_distinct_spelling(
+                seen_spellings,
+                &range_type.name,
+                range_type.position,
+                &format!("type in {scope_name}"),
+            )?;
+        }
+        TypeDecl::Array(array_type) => {
+            register_case_distinct_spelling(
+                seen_spellings,
+                &array_type.name,
+                array_type.position,
+                &format!("type in {scope_name}"),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn casefold_identifier(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn register_case_distinct_spelling(
+    seen_spellings: &mut HashMap<String, String>,
+    name: &str,
+    position: Position,
+    context: &str,
+) -> Result<(), Diagnostic> {
+    let folded = casefold_identifier(name);
+    if let Some(existing) = seen_spellings.get(&folded) {
+        if existing != name {
+            return Err(Diagnostic::new(
+                format!(
+                    "{context} `{name}` differs only by case from `{existing}`; Ada identifiers are case-insensitive"
+                ),
+                position,
+            ));
+        }
+    } else {
+        seen_spellings.insert(folded, name.to_string());
+    }
+
+    Ok(())
+}
+
 fn insert_signature(
     index: &mut SignatureIndex,
     signature: SubprogramSignature,
     position: Position,
     message: &str,
 ) -> Result<(), Diagnostic> {
+    if let Some(existing_name) = index.keys().find(|existing_name| {
+        *existing_name != &signature.key.name
+            && existing_name.eq_ignore_ascii_case(&signature.key.name)
+    }) {
+        return Err(Diagnostic::new(
+            format!(
+                "subprogram `{}` differs only by case from `{existing_name}`; Ada identifiers are case-insensitive",
+                signature.key.name
+            ),
+            position,
+        ));
+    }
+
     let overloads = index.entry(signature.key.name.clone()).or_default();
     if overloads
         .iter()
@@ -3296,10 +4954,17 @@ fn extend_candidates<'a>(
     };
 
     for signature in source {
-        if !target.iter().any(|existing| existing.key == signature.key) {
+        if !target
+            .iter()
+            .any(|existing| same_call_target(existing, signature))
+        {
             target.push(signature);
         }
     }
+}
+
+fn same_call_target(lhs: &SubprogramSignature, rhs: &SubprogramSignature) -> bool {
+    lhs.key == rhs.key && lhs.owner_package() == rhs.owner_package()
 }
 
 fn expr_to_name(expr: &Expr) -> Option<Name> {
@@ -3318,6 +4983,41 @@ fn display_callee(expr: &Expr) -> String {
     expr_to_name(expr)
         .map(|name| name.as_string())
         .unwrap_or_else(|| "<call>".to_string())
+}
+
+fn render_name_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_subprogram_candidate_list(candidates: &[&SubprogramSignature]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| render_subprogram_candidate(candidate))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_subprogram_candidate(candidate: &SubprogramSignature) -> String {
+    let name = match candidate.owner_package() {
+        Some(package_name) => format!("{package_name}.{}", candidate.key.name),
+        None => candidate.key.name.clone(),
+    };
+    let params = candidate
+        .params
+        .iter()
+        .map(|param| param.ty.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let signature = format!("{name}({params})");
+
+    match &candidate.key.return_type {
+        Some(return_type) => format!("`{signature} -> {return_type}`"),
+        None => format!("`{signature}`"),
+    }
 }
 
 fn optional_exprs_match(lhs: &Option<Expr>, rhs: &Option<Expr>) -> bool {
@@ -3474,6 +5174,23 @@ fn collect_type_symbols(
     }
 }
 
+fn collect_type_names(type_decl: &TypeDecl, type_names: &mut HashSet<String>) {
+    match type_decl {
+        TypeDecl::Record(record) => {
+            type_names.insert(record.name.clone());
+        }
+        TypeDecl::Enum(enum_type) => {
+            type_names.insert(enum_type.name.clone());
+        }
+        TypeDecl::Range(range_type) => {
+            type_names.insert(range_type.name.clone());
+        }
+        TypeDecl::Array(array_type) => {
+            type_names.insert(array_type.name.clone());
+        }
+    }
+}
+
 fn collect_type_metadata(
     type_decl: &TypeDecl,
     type_kinds: &mut HashMap<String, TypeKind>,
@@ -3493,7 +5210,12 @@ fn collect_type_metadata(
             );
         }
         TypeDecl::Enum(enum_type) => {
-            type_kinds.insert(enum_type.name.clone(), TypeKind::Enum);
+            type_kinds.insert(
+                enum_type.name.clone(),
+                TypeKind::Enum {
+                    variants: enum_type.variants.clone(),
+                },
+            );
             for variant in &enum_type.variants {
                 enum_literal_types
                     .entry(variant.clone())

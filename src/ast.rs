@@ -7,8 +7,8 @@ pub struct Program {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    Import(Name),
-    Use(Name),
+    Import { name: Name, position: Position },
+    Use { name: Name, position: Position },
     Subprogram(Subprogram),
     Type(TypeDecl),
     Package(Package),
@@ -190,12 +190,18 @@ pub enum Statement {
     Null {
         position: Position,
     },
+    Break {
+        position: Position,
+    },
+    Continue {
+        position: Position,
+    },
     Assert {
         expr: Expr,
         position: Position,
     },
     Return {
-        expr: Expr,
+        expr: Option<Expr>,
         position: Position,
     },
     Assign {

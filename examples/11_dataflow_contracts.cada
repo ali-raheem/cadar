@@ -1,18 +1,27 @@
 import Text_IO;
 use Text_IO;
+import Flow;
 
-fn Add(Integer A, Integer B) -> Integer
-    global(null)
-    depends(result => [A, B]) {
-    return A + B;
+package Flow {
+    fn Add(Integer A, Integer B) -> Integer
+        global(null)
+        depends(result => [A, B]);
+
+    fn Show(Integer Value)
+        global(null)
+        depends(null => Value);
 }
 
-fn Show(Integer Value)
-    global(null)
-    depends(null => Value) {
-    Put_Line(Integer.image(Value));
+package body Flow {
+    fn Add(Integer A, Integer B) -> Integer {
+        return A + B;
+    }
+
+    fn Show(Integer Value) {
+        Put_Line(Integer.image(Value));
+    }
 }
 
 fn Main() {
-    Show(Add(2, 3));
+    Flow.Show(Flow.Add(2, 3));
 }

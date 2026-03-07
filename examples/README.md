@@ -4,6 +4,11 @@ These examples are ordered from minimal to more feature-rich. Each `.cada`
 program defines a `Main` entry point, transpiles with `cadar --write
 --split-units`, and is exercised by the GNAT integration tests.
 
+For split-unit output, keep overload sets inside packages rather than as
+top-level subprograms, since Ada library-unit filenames must stay unique.
+When one top-level subprogram calls another, add `import Name;` explicitly in
+the calling source so visibility matches Ada library-unit behavior.
+
 - `01_hello_world.cada`: smallest runnable program using `Text_IO`.
 - `02_control_flow.cada`: `while`, `for`, `if`, `case`, and boolean logic.
 - `03_packages_and_contracts.cada`: package spec/body plus pre/postconditions.
@@ -29,5 +34,7 @@ program defines a `Main` entry point, transpiles with `cadar --write
   bodies, lowered through Ada `declare` blocks.
 - `15_float_and_character_literals.cada`: native decimal `Float` literals and
   single-quoted `Character` literals.
+- `16_loop_control.cada`: procedure `return;` plus loop `break;` and
+  `continue;`, lowered to Ada `return;`, `exit;`, and `continue;`.
 
 Expected stdout for each example lives in the matching `.stdout` file.

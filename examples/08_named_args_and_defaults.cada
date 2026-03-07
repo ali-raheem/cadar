@@ -1,5 +1,6 @@
 import Text_IO;
 use Text_IO;
+import Adjust;
 
 fn Adjust(Integer Value, Integer Scale = 10, Integer Offset = 1) -> Integer {
     return Value * Scale + Offset;

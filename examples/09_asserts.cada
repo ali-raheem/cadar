@@ -1,5 +1,6 @@
 import Text_IO;
 use Text_IO;
+import Check_Positive;
 
 fn Check_Positive(Integer Value) {
     assert(Value > 0);

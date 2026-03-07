@@ -1,0 +1,36 @@
+import Text_IO;
+use Text_IO;
+import Maybe_Print;
+
+fn Maybe_Print(Boolean Enabled) {
+    if (not Enabled) {
+        return;
+    }
+
+    Put_Line("enabled");
+}
+
+fn Main() {
+    Integer Count = 0;
+
+    while (Count < 5) {
+        Count = Count + 1;
+
+        if (Count == 2) {
+            continue;
+        }
+
+        if (Count == 4) {
+            break;
+        }
+
+        if (Count == 1) {
+            Put_Line("one");
+        } else {
+            Put_Line("three");
+        }
+    }
+
+    Maybe_Print(false);
+    Maybe_Print(true);
+}

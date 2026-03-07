@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
@@ -7,7 +7,8 @@ use crate::{
         LoopVariantDirection, Name, Package, PackageItem, ParamMode, Program, RangeType,
         RecordType, Statement, StatementBlock, Subprogram, TypeDecl, UnaryOp,
     },
-    diagnostic::{Diagnostic, IndexedDiagnostic},
+    diagnostic::{Diagnostic, IndexedDiagnostic, Position},
+    sema::SemanticInfo,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,12 @@ pub struct AdaProgram {
     pub context: Vec<AdaContextItem>,
     pub spec_units: Vec<AdaUnit<AdaSpecUnit>>,
     pub body_units: Vec<AdaUnit<AdaBodyUnit>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LibraryUnits {
+    top_level_subprograms: HashSet<Name>,
+    packages: HashSet<Name>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,12 +216,14 @@ pub struct AdaObjectDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdaStatement {
     Null,
+    Exit,
+    Continue,
     Block {
         declarations: Vec<AdaObjectDecl>,
         statements: Vec<AdaStatement>,
     },
     Assert(AdaExpr),
-    Return(AdaExpr),
+    Return(Option<AdaExpr>),
     Assign {
         target: AdaExpr,
         value: AdaExpr,
@@ -293,6 +302,10 @@ pub enum AdaExpr {
     String(String),
     Name(Name),
     Result(String),
+    TypeQualified {
+        ty: Name,
+        expr: Box<AdaExpr>,
+    },
     Qualified {
         prefix: Box<AdaExpr>,
         member: String,
@@ -322,7 +335,29 @@ pub enum AdaExpr {
     },
 }
 
-pub fn lower_all(programs: Vec<Program>) -> Result<AdaProgram, IndexedDiagnostic> {
+struct LoweringContext<'a> {
+    source_index: usize,
+    semantic_info: &'a SemanticInfo,
+}
+
+impl LoweringContext<'_> {
+    fn call_return_qualification(&self, position: crate::diagnostic::Position) -> Option<Name> {
+        self.semantic_info
+            .call_return_qualification(self.source_index, position)
+            .map(type_name_to_name)
+    }
+}
+
+fn type_name_to_name(type_name: &str) -> Name {
+    Name {
+        segments: type_name.split('.').map(str::to_string).collect(),
+    }
+}
+
+pub fn lower_all(
+    programs: Vec<Program>,
+    semantic_info: &SemanticInfo,
+) -> Result<AdaProgram, IndexedDiagnostic> {
     let mut spec_units = Vec::new();
     let mut body_units = Vec::new();
     let mut seen_specs = HashSet::new();
@@ -339,14 +374,18 @@ pub fn lower_all(programs: Vec<Program>) -> Result<AdaProgram, IndexedDiagnostic
     let mut aggregate_contexts = Vec::new();
 
     for (source_index, program) in programs.into_iter().enumerate() {
+        let lowering = LoweringContext {
+            source_index,
+            semantic_info,
+        };
         let unit_context = collect_program_context(&program);
         aggregate_contexts.push(unit_context.clone());
 
         for item in program.items {
             match item {
-                Item::Import(_) | Item::Use(_) => {}
+                Item::Import { .. } | Item::Use { .. } => {}
                 Item::Subprogram(subprogram) => {
-                    let spec = lower_spec(&subprogram)
+                    let spec = lower_spec(&subprogram, &lowering)
                         .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?;
                     if seen_specs.insert(subprogram_identity(&spec)) {
                         spec_units.push(AdaUnit {
@@ -355,9 +394,10 @@ pub fn lower_all(programs: Vec<Program>) -> Result<AdaProgram, IndexedDiagnostic
                         });
                     }
                     if let Some(body) = subprogram.body {
-                        let body = lower_body(spec, body.items).map_err(|diagnostic| {
-                            IndexedDiagnostic::new(source_index, diagnostic)
-                        })?;
+                        let body =
+                            lower_body(spec, body.items, &lowering).map_err(|diagnostic| {
+                                IndexedDiagnostic::new(source_index, diagnostic)
+                            })?;
                         body_units.push(AdaUnit {
                             context: unit_context.clone(),
                             item: AdaBodyUnit::Subprogram(body),
@@ -367,10 +407,10 @@ pub fn lower_all(programs: Vec<Program>) -> Result<AdaProgram, IndexedDiagnostic
                 Item::Type(type_decl) => {
                     spec_units.push(AdaUnit {
                         context: unit_context.clone(),
-                        item: AdaSpecUnit::Type(lower_type_decl(type_decl)),
+                        item: AdaSpecUnit::Type(lower_type_decl(type_decl, &lowering)),
                     });
                 }
-                Item::Package(package) => match lower_package(package)
+                Item::Package(package) => match lower_package(package, &lowering)
                     .map_err(|diagnostic| IndexedDiagnostic::new(source_index, diagnostic))?
                 {
                     LoweredPackage::Spec(package_spec) => {
@@ -411,11 +451,11 @@ fn collect_program_context(program: &Program) -> Vec<AdaContextItem> {
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Import(name) => Some(AdaContextItem {
+            Item::Import { name, .. } => Some(AdaContextItem {
                 kind: AdaContextKind::With,
                 name: name.clone(),
             }),
-            Item::Use(name) => Some(AdaContextItem {
+            Item::Use { name, .. } => Some(AdaContextItem {
                 kind: AdaContextKind::Use,
                 name: name.clone(),
             }),
@@ -447,14 +487,17 @@ enum LoweredPackage {
     },
 }
 
-fn lower_package(package: Package) -> Result<LoweredPackage, Diagnostic> {
+fn lower_package(
+    package: Package,
+    lowering: &LoweringContext<'_>,
+) -> Result<LoweredPackage, Diagnostic> {
     if package.is_body {
         let mut spec_items = Vec::new();
         let mut body_items = Vec::new();
         for item in package.items {
             match item {
                 PackageItem::Subprogram(subprogram) => {
-                    let spec = lower_spec(&subprogram)?;
+                    let spec = lower_spec(&subprogram, lowering)?;
                     spec_items.push(AdaPackageSpecItem::Subprogram(spec.clone()));
                     let Some(body) = subprogram.body else {
                         return Err(Diagnostic::new(
@@ -463,14 +506,16 @@ fn lower_package(package: Package) -> Result<LoweredPackage, Diagnostic> {
                         ));
                     };
                     body_items.push(AdaPackageBodyItem::Subprogram(lower_body(
-                        spec, body.items,
+                        spec, body.items, lowering,
                     )?));
                 }
                 PackageItem::Type(type_decl) => {
-                    body_items.push(AdaPackageBodyItem::Type(lower_type_decl(type_decl)));
+                    body_items.push(AdaPackageBodyItem::Type(lower_type_decl(
+                        type_decl, lowering,
+                    )));
                 }
                 PackageItem::Object(decl) => {
-                    body_items.push(AdaPackageBodyItem::Object(lower_decl(decl)?));
+                    body_items.push(AdaPackageBodyItem::Object(lower_decl(decl, lowering)?));
                 }
             }
         }
@@ -495,13 +540,18 @@ fn lower_package(package: Package) -> Result<LoweredPackage, Diagnostic> {
                             subprogram.position,
                         ));
                     }
-                    items.push(AdaPackageSpecItem::Subprogram(lower_spec(&subprogram)?));
+                    items.push(AdaPackageSpecItem::Subprogram(lower_spec(
+                        &subprogram,
+                        lowering,
+                    )?));
                 }
                 PackageItem::Type(type_decl) => {
-                    items.push(AdaPackageSpecItem::Type(lower_type_decl(type_decl)));
+                    items.push(AdaPackageSpecItem::Type(lower_type_decl(
+                        type_decl, lowering,
+                    )));
                 }
                 PackageItem::Object(decl) => {
-                    items.push(AdaPackageSpecItem::Object(lower_decl(decl)?));
+                    items.push(AdaPackageSpecItem::Object(lower_decl(decl, lowering)?));
                 }
             }
         }
@@ -512,7 +562,7 @@ fn lower_package(package: Package) -> Result<LoweredPackage, Diagnostic> {
     }
 }
 
-fn lower_type_decl(type_decl: TypeDecl) -> AdaTypeDecl {
+fn lower_type_decl(type_decl: TypeDecl, lowering: &LoweringContext<'_>) -> AdaTypeDecl {
     match type_decl {
         TypeDecl::Record(RecordType { name, fields, .. }) => AdaTypeDecl::Record(AdaRecordType {
             name,
@@ -536,8 +586,8 @@ fn lower_type_decl(type_decl: TypeDecl) -> AdaTypeDecl {
         }) => AdaTypeDecl::Range(AdaRangeType {
             name,
             base,
-            start: lower_expr(start),
-            end: lower_expr(end),
+            start: lower_expr(start, lowering),
+            end: lower_expr(end, lowering),
         }),
         TypeDecl::Array(ArrayType {
             name,
@@ -547,25 +597,35 @@ fn lower_type_decl(type_decl: TypeDecl) -> AdaTypeDecl {
             ..
         }) => AdaTypeDecl::Array(AdaArrayType {
             name,
-            start: lower_expr(start),
-            end: lower_expr(end),
+            start: lower_expr(start, lowering),
+            end: lower_expr(end, lowering),
             element_type,
         }),
     }
 }
 
-fn lower_spec(subprogram: &Subprogram) -> Result<AdaSubprogramSpec, Diagnostic> {
+fn lower_spec(
+    subprogram: &Subprogram,
+    lowering: &LoweringContext<'_>,
+) -> Result<AdaSubprogramSpec, Diagnostic> {
     let preconditions = subprogram
         .requires
         .iter()
         .cloned()
-        .map(lower_expr)
+        .map(|expr| lower_expr(expr, lowering))
         .collect();
     let postconditions = subprogram
         .ensures
         .iter()
         .cloned()
-        .map(|expr| lower_contract_expr(expr, &subprogram.name, subprogram.return_type.is_some()))
+        .map(|expr| {
+            lower_contract_expr(
+                expr,
+                &subprogram.name,
+                subprogram.return_type.is_some(),
+                lowering,
+            )
+        })
         .collect::<Result<Vec<_>, Diagnostic>>()?;
     Ok(AdaSubprogramSpec {
         name: subprogram.name.clone(),
@@ -576,7 +636,7 @@ fn lower_spec(subprogram: &Subprogram) -> Result<AdaSubprogramSpec, Diagnostic> 
                 mode: param.mode,
                 ty: param.ty.clone(),
                 name: param.name.clone(),
-                default: param.default.clone().map(lower_expr),
+                default: param.default.clone().map(|expr| lower_expr(expr, lowering)),
             })
             .collect(),
         return_type: subprogram.return_type.clone(),
@@ -632,6 +692,7 @@ fn lower_depends_contract(contract: DependsContract, is_function: bool) -> AdaDe
 fn lower_body(
     spec: AdaSubprogramSpec,
     items: Vec<BlockItem>,
+    lowering: &LoweringContext<'_>,
 ) -> Result<AdaSubprogramBody, Diagnostic> {
     let mut declarations = Vec::new();
     let mut statements = Vec::new();
@@ -646,11 +707,11 @@ fn lower_body(
                         decl.position,
                     ));
                 }
-                declarations.push(lower_decl(decl)?);
+                declarations.push(lower_decl(decl, lowering)?);
             }
             BlockItem::Statement(statement) => {
                 saw_statement = true;
-                statements.push(lower_statement(statement)?);
+                statements.push(lower_statement(statement, lowering)?);
             }
         }
     }
@@ -662,7 +723,10 @@ fn lower_body(
     })
 }
 
-fn lower_decl(decl: LocalDecl) -> Result<AdaObjectDecl, Diagnostic> {
+fn lower_decl(
+    decl: LocalDecl,
+    lowering: &LoweringContext<'_>,
+) -> Result<AdaObjectDecl, Diagnostic> {
     if decl.is_const && decl.initializer.is_none() {
         return Err(Diagnostic::new(
             format!("constant `{}` requires an initializer", decl.name),
@@ -674,21 +738,28 @@ fn lower_decl(decl: LocalDecl) -> Result<AdaObjectDecl, Diagnostic> {
         is_const: decl.is_const,
         ty: decl.ty,
         name: decl.name,
-        initializer: decl.initializer.map(lower_expr),
+        initializer: decl.initializer.map(|expr| lower_expr(expr, lowering)),
     })
 }
 
-fn lower_statement(statement: Statement) -> Result<AdaStatement, Diagnostic> {
+fn lower_statement(
+    statement: Statement,
+    lowering: &LoweringContext<'_>,
+) -> Result<AdaStatement, Diagnostic> {
     match statement {
         Statement::Null { .. } => Ok(AdaStatement::Null),
-        Statement::Assert { expr, .. } => Ok(AdaStatement::Assert(lower_expr(expr))),
-        Statement::Return { expr, .. } => Ok(AdaStatement::Return(lower_expr(expr))),
+        Statement::Break { .. } => Ok(AdaStatement::Exit),
+        Statement::Continue { .. } => Ok(AdaStatement::Continue),
+        Statement::Assert { expr, .. } => Ok(AdaStatement::Assert(lower_expr(expr, lowering))),
+        Statement::Return { expr, .. } => Ok(AdaStatement::Return(
+            expr.map(|return_expr| lower_expr(return_expr, lowering)),
+        )),
         Statement::Assign { target, value, .. } => Ok(AdaStatement::Assign {
-            target: lower_assignment_target(target)?,
-            value: lower_expr(value),
+            target: lower_assignment_target(target, lowering)?,
+            value: lower_expr(value, lowering),
         }),
         Statement::Expr { expr, position } => {
-            let lowered = lower_expr(expr);
+            let lowered = lower_expr(expr, lowering);
             if matches!(lowered, AdaExpr::Call { .. }) {
                 Ok(AdaStatement::Call(lowered))
             } else {
@@ -698,10 +769,14 @@ fn lower_statement(statement: Statement) -> Result<AdaStatement, Diagnostic> {
                 ))
             }
         }
-        Statement::If(if_statement) => Ok(AdaStatement::If(lower_if_statement(if_statement)?)),
-        Statement::Case(case_statement) => {
-            Ok(AdaStatement::Case(lower_case_statement(case_statement)?))
-        }
+        Statement::If(if_statement) => Ok(AdaStatement::If(lower_if_statement(
+            if_statement,
+            lowering,
+        )?)),
+        Statement::Case(case_statement) => Ok(AdaStatement::Case(lower_case_statement(
+            case_statement,
+            lowering,
+        )?)),
         Statement::While {
             condition,
             invariants,
@@ -709,10 +784,16 @@ fn lower_statement(statement: Statement) -> Result<AdaStatement, Diagnostic> {
             body,
             ..
         } => Ok(AdaStatement::While {
-            condition: lower_expr(condition),
-            invariants: invariants.into_iter().map(lower_expr).collect(),
-            variants: variants.into_iter().map(lower_loop_variant).collect(),
-            body: lower_statement_block(body)?,
+            condition: lower_expr(condition, lowering),
+            invariants: invariants
+                .into_iter()
+                .map(|expr| lower_expr(expr, lowering))
+                .collect(),
+            variants: variants
+                .into_iter()
+                .map(|variant| lower_loop_variant(variant, lowering))
+                .collect(),
+            body: lower_statement_block(body, lowering)?,
         }),
         Statement::For(ForStatement {
             iterator_type: _,
@@ -725,28 +806,42 @@ fn lower_statement(statement: Statement) -> Result<AdaStatement, Diagnostic> {
             ..
         }) => Ok(AdaStatement::For {
             iterator,
-            start: lower_expr(start),
-            end: lower_expr(end),
-            invariants: invariants.into_iter().map(lower_expr).collect(),
-            variants: variants.into_iter().map(lower_loop_variant).collect(),
-            body: lower_statement_block(body)?,
+            start: lower_expr(start, lowering),
+            end: lower_expr(end, lowering),
+            invariants: invariants
+                .into_iter()
+                .map(|expr| lower_expr(expr, lowering))
+                .collect(),
+            variants: variants
+                .into_iter()
+                .map(|variant| lower_loop_variant(variant, lowering))
+                .collect(),
+            body: lower_statement_block(body, lowering)?,
         }),
     }
 }
 
-fn lower_loop_variant(variant: crate::ast::LoopVariant) -> AdaLoopVariant {
+fn lower_loop_variant(
+    variant: crate::ast::LoopVariant,
+    lowering: &LoweringContext<'_>,
+) -> AdaLoopVariant {
     AdaLoopVariant {
         direction: match variant.direction {
             LoopVariantDirection::Increases => AdaLoopVariantDirection::Increases,
             LoopVariantDirection::Decreases => AdaLoopVariantDirection::Decreases,
         },
-        expr: lower_expr(variant.expr),
+        expr: lower_expr(variant.expr, lowering),
     }
 }
 
-fn lower_assignment_target(target: Expr) -> Result<AdaExpr, Diagnostic> {
+fn lower_assignment_target(
+    target: Expr,
+    lowering: &LoweringContext<'_>,
+) -> Result<AdaExpr, Diagnostic> {
     match target {
-        Expr::Name { .. } | Expr::Member { .. } | Expr::Index { .. } => Ok(lower_expr(target)),
+        Expr::Name { .. } | Expr::Member { .. } | Expr::Index { .. } => {
+            Ok(lower_expr(target, lowering))
+        }
         _ => Err(Diagnostic::new(
             "invalid assignment target",
             target.position(),
@@ -754,45 +849,61 @@ fn lower_assignment_target(target: Expr) -> Result<AdaExpr, Diagnostic> {
     }
 }
 
-fn lower_if_statement(statement: IfStatement) -> Result<AdaIfStatement, Diagnostic> {
+fn lower_if_statement(
+    statement: IfStatement,
+    lowering: &LoweringContext<'_>,
+) -> Result<AdaIfStatement, Diagnostic> {
     Ok(AdaIfStatement {
-        condition: lower_expr(statement.condition),
-        then_branch: lower_statement_block(statement.then_branch)?,
+        condition: lower_expr(statement.condition, lowering),
+        then_branch: lower_statement_block(statement.then_branch, lowering)?,
         else_if_branches: statement
             .else_if_branches
             .into_iter()
             .map(|branch| {
                 Ok(AdaElseIfBranch {
-                    condition: lower_expr(branch.condition),
-                    body: lower_statement_block(branch.body)?,
+                    condition: lower_expr(branch.condition, lowering),
+                    body: lower_statement_block(branch.body, lowering)?,
                 })
             })
             .collect::<Result<Vec<_>, Diagnostic>>()?,
         else_branch: statement
             .else_branch
-            .map(lower_statement_block)
+            .map(|block| lower_statement_block(block, lowering))
             .transpose()?,
     })
 }
 
-fn lower_case_statement(statement: CaseStatement) -> Result<AdaCaseStatement, Diagnostic> {
+fn lower_case_statement(
+    statement: CaseStatement,
+    lowering: &LoweringContext<'_>,
+) -> Result<AdaCaseStatement, Diagnostic> {
     Ok(AdaCaseStatement {
-        expr: lower_expr(statement.expr),
+        expr: lower_expr(statement.expr, lowering),
         arms: statement
             .arms
             .into_iter()
             .map(|arm| {
                 Ok(AdaCaseArm {
-                    choices: arm.choices.into_iter().map(lower_expr).collect(),
-                    body: lower_statement_block(arm.body)?,
+                    choices: arm
+                        .choices
+                        .into_iter()
+                        .map(|expr| lower_expr(expr, lowering))
+                        .collect(),
+                    body: lower_statement_block(arm.body, lowering)?,
                 })
             })
             .collect::<Result<Vec<_>, Diagnostic>>()?,
-        else_arm: statement.else_arm.map(lower_statement_block).transpose()?,
+        else_arm: statement
+            .else_arm
+            .map(|block| lower_statement_block(block, lowering))
+            .transpose()?,
     })
 }
 
-fn lower_statement_block(block: StatementBlock) -> Result<Vec<AdaStatement>, Diagnostic> {
+fn lower_statement_block(
+    block: StatementBlock,
+    lowering: &LoweringContext<'_>,
+) -> Result<Vec<AdaStatement>, Diagnostic> {
     let mut declarations = Vec::new();
     let mut statements = Vec::new();
     let mut saw_statement = false;
@@ -806,11 +917,11 @@ fn lower_statement_block(block: StatementBlock) -> Result<Vec<AdaStatement>, Dia
                         decl.position,
                     ));
                 }
-                declarations.push(lower_decl(decl)?);
+                declarations.push(lower_decl(decl, lowering)?);
             }
             BlockItem::Statement(statement) => {
                 saw_statement = true;
-                statements.push(lower_statement(statement)?);
+                statements.push(lower_statement(statement, lowering)?);
             }
         }
     }
@@ -829,6 +940,7 @@ fn lower_contract_expr(
     expr: Expr,
     subprogram_name: &str,
     allow_result: bool,
+    lowering: &LoweringContext<'_>,
 ) -> Result<AdaExpr, Diagnostic> {
     lower_expr_internal(
         expr,
@@ -836,11 +948,12 @@ fn lower_contract_expr(
             subprogram_name,
             allow_result,
         }),
+        lowering,
     )
 }
 
-fn lower_expr(expr: Expr) -> AdaExpr {
-    lower_expr_internal(expr, None).expect("runtime expression lowering should not fail")
+fn lower_expr(expr: Expr, lowering: &LoweringContext<'_>) -> AdaExpr {
+    lower_expr_internal(expr, None, lowering).expect("runtime expression lowering should not fail")
 }
 
 #[derive(Clone, Copy)]
@@ -852,6 +965,7 @@ struct ContractContext<'a> {
 fn lower_expr_internal(
     expr: Expr,
     contract: Option<ContractContext<'_>>,
+    lowering: &LoweringContext<'_>,
 ) -> Result<AdaExpr, Diagnostic> {
     match expr {
         Expr::Bool { value, .. } => Ok(AdaExpr::Bool(value)),
@@ -875,7 +989,7 @@ fn lower_expr_internal(
             Ok(AdaExpr::Name(name))
         }
         Expr::Member { base, member, .. } => {
-            let prefix = Box::new(lower_expr_internal(*base, contract)?);
+            let prefix = Box::new(lower_expr_internal(*base, contract, lowering)?);
             match member.as_str() {
                 "length" => Ok(AdaExpr::Attribute {
                     prefix,
@@ -893,41 +1007,60 @@ fn lower_expr_internal(
             }
         }
         Expr::Index { base, index, .. } => Ok(AdaExpr::Index {
-            base: Box::new(lower_expr_internal(*base, contract)?),
-            index: Box::new(lower_expr_internal(*index, contract)?),
+            base: Box::new(lower_expr_internal(*base, contract, lowering)?),
+            index: Box::new(lower_expr_internal(*index, contract, lowering)?),
         }),
-        Expr::Call { callee, args, .. } => Ok(AdaExpr::Call {
-            callee: Box::new(lower_expr_internal(*callee, contract)?),
-            args: args
-                .into_iter()
-                .map(|arg| {
-                    Ok(AdaCallArg {
-                        name: arg.name,
-                        value: lower_expr_internal(arg.value, contract)?,
+        Expr::Call {
+            callee,
+            args,
+            position,
+        } => {
+            let call = AdaExpr::Call {
+                callee: Box::new(lower_expr_internal(*callee, contract, lowering)?),
+                args: args
+                    .into_iter()
+                    .map(|arg| {
+                        Ok(AdaCallArg {
+                            name: arg.name,
+                            value: lower_expr_internal(arg.value, contract, lowering)?,
+                        })
                     })
+                    .collect::<Result<Vec<_>, Diagnostic>>()?,
+            };
+            if let Some(ty) = lowering.call_return_qualification(position) {
+                Ok(AdaExpr::TypeQualified {
+                    ty,
+                    expr: Box::new(call),
                 })
-                .collect::<Result<Vec<_>, Diagnostic>>()?,
-        }),
+            } else {
+                Ok(call)
+            }
+        }
         Expr::RecordLiteral { fields, .. } => Ok(AdaExpr::NamedAggregate(
             fields
                 .into_iter()
-                .map(|field| Ok((field.name, lower_expr_internal(field.value, contract)?)))
+                .map(|field| {
+                    Ok((
+                        field.name,
+                        lower_expr_internal(field.value, contract, lowering)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>, Diagnostic>>()?,
         )),
         Expr::ArrayLiteral { elements, .. } => Ok(AdaExpr::Aggregate(
             elements
                 .into_iter()
-                .map(|element| lower_expr_internal(element, contract))
+                .map(|element| lower_expr_internal(element, contract, lowering))
                 .collect::<Result<Vec<_>, Diagnostic>>()?,
         )),
         Expr::Unary { op, expr, .. } => Ok(AdaExpr::Unary {
             op,
-            expr: Box::new(lower_expr_internal(*expr, contract)?),
+            expr: Box::new(lower_expr_internal(*expr, contract, lowering)?),
         }),
         Expr::Binary { lhs, op, rhs, .. } => Ok(AdaExpr::Binary {
-            lhs: Box::new(lower_expr_internal(*lhs, contract)?),
+            lhs: Box::new(lower_expr_internal(*lhs, contract, lowering)?),
             op,
-            rhs: Box::new(lower_expr_internal(*rhs, contract)?),
+            rhs: Box::new(lower_expr_internal(*rhs, contract, lowering)?),
         }),
     }
 }
@@ -942,7 +1075,7 @@ pub fn render(program: &AdaProgram) -> AdaOutputs {
 pub fn render_files(program: &AdaProgram, fallback_stem: &str) -> Vec<GeneratedFile> {
     let mut files = Vec::new();
     let mut aggregate_spec_types = Vec::new();
-    let top_level_subprogram_units = collect_top_level_subprogram_units(program);
+    let library_units = collect_library_units(program);
     let support_package = program
         .spec_units
         .iter()
@@ -964,10 +1097,10 @@ pub fn render_files(program: &AdaProgram, fallback_stem: &str) -> Vec<GeneratedF
                 let self_name = Name {
                     segments: vec![spec.name.clone()],
                 };
-                let extra_withs =
-                    collect_subprogram_spec_dependencies(spec, &top_level_subprogram_units);
+                let extra_withs = collect_subprogram_spec_dependencies(spec, &library_units);
                 let context = render_context_for_unit(
                     &unit.context,
+                    &library_units,
                     Some(&self_name),
                     support_package.as_ref(),
                     &extra_withs,
@@ -979,10 +1112,10 @@ pub fn render_files(program: &AdaProgram, fallback_stem: &str) -> Vec<GeneratedF
             }
             AdaSpecUnit::Type(type_decl) => aggregate_spec_types.push(type_decl),
             AdaSpecUnit::Package(package) => {
-                let extra_withs =
-                    collect_package_spec_dependencies(package, &top_level_subprogram_units);
+                let extra_withs = collect_package_spec_dependencies(package, &library_units);
                 let context = render_context_for_unit(
                     &unit.context,
+                    &library_units,
                     Some(&package.name),
                     support_package.as_ref(),
                     &extra_withs,
@@ -996,7 +1129,13 @@ pub fn render_files(program: &AdaProgram, fallback_stem: &str) -> Vec<GeneratedF
     }
 
     if let Some(support_package) = &support_package {
-        let context = render_context_for_unit(&support_context, Some(support_package), None, &[]);
+        let context = render_context_for_unit(
+            &support_context,
+            &library_units,
+            Some(support_package),
+            None,
+            &[],
+        );
         files.push(GeneratedFile {
             filename: format!("{}.ads", unit_stem_from_name(support_package)),
             contents: compose_file(
@@ -1012,10 +1151,10 @@ pub fn render_files(program: &AdaProgram, fallback_stem: &str) -> Vec<GeneratedF
                 let self_name = Name {
                     segments: vec![body.spec.name.clone()],
                 };
-                let extra_withs =
-                    collect_subprogram_body_dependencies(body, &top_level_subprogram_units);
+                let extra_withs = collect_subprogram_body_dependencies(body, &library_units);
                 let context = render_context_for_unit(
                     &unit.context,
+                    &library_units,
                     Some(&self_name),
                     support_package.as_ref(),
                     &extra_withs,
@@ -1026,23 +1165,241 @@ pub fn render_files(program: &AdaProgram, fallback_stem: &str) -> Vec<GeneratedF
                 });
             }
             AdaBodyUnit::Package(package) => {
-                let extra_withs =
-                    collect_package_body_dependencies(package, &top_level_subprogram_units);
+                let extra_withs = collect_package_body_dependencies(package, &library_units);
                 let context = render_context_for_unit(
                     &unit.context,
+                    &library_units,
                     Some(&package.name),
                     support_package.as_ref(),
                     &extra_withs,
                 );
                 files.push(GeneratedFile {
                     filename: format!("{}.adb", unit_stem_from_name(&package.name)),
-                    contents: compose_file(&context, render_package_body(package)),
+                    contents: compose_file(
+                        &context,
+                        render_package_body(package, find_package_spec(program, &package.name)),
+                    ),
                 });
             }
         }
     }
 
     files
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitUnitSubprogramKey {
+    params: Vec<(ParamMode, String)>,
+    return_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SplitUnitSubprogramUnit {
+    name: String,
+    stem: String,
+    key: SplitUnitSubprogramKey,
+    source_index: usize,
+    position: Position,
+    has_body: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SplitUnitPackageUnit {
+    name: Name,
+    stem: String,
+    source_index: usize,
+    position: Position,
+    has_spec: bool,
+    has_body: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SplitUnitFileOwner {
+    description: String,
+    source_index: usize,
+    position: Position,
+}
+
+pub fn validate_split_unit_layout(
+    programs: &[Program],
+    fallback_stem: &str,
+) -> Result<(), IndexedDiagnostic> {
+    use std::collections::hash_map::Entry;
+
+    let mut subprograms = HashMap::new();
+    let mut packages = HashMap::new();
+    let mut first_top_level_type = None;
+
+    for (source_index, program) in programs.iter().enumerate() {
+        for item in &program.items {
+            match item {
+                Item::Subprogram(subprogram) => {
+                    let stem = unit_stem_from_identifier(&subprogram.name);
+                    let key = split_unit_subprogram_key(subprogram);
+                    match subprograms.entry(stem.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(SplitUnitSubprogramUnit {
+                                name: subprogram.name.clone(),
+                                stem,
+                                key,
+                                source_index,
+                                position: subprogram.position,
+                                has_body: subprogram.body.is_some(),
+                            });
+                        }
+                        Entry::Occupied(mut entry) => {
+                            if entry.get().key != key {
+                                return Err(IndexedDiagnostic::new(
+                                    source_index,
+                                    Diagnostic::new(
+                                        format!(
+                                            "split-unit output does not support overloaded top-level subprograms like `{}`; place overloads in a package or use aggregate output",
+                                            subprogram.name
+                                        ),
+                                        subprogram.position,
+                                    ),
+                                ));
+                            }
+                            entry.get_mut().has_body |= subprogram.body.is_some();
+                        }
+                    }
+                }
+                Item::Package(package) => {
+                    let package_key = package.name.as_string();
+                    packages
+                        .entry(package_key)
+                        .and_modify(|unit: &mut SplitUnitPackageUnit| {
+                            unit.has_spec |= !package.is_body;
+                            unit.has_body |= package.is_body;
+                        })
+                        .or_insert_with(|| SplitUnitPackageUnit {
+                            name: package.name.clone(),
+                            stem: unit_stem_from_name(&package.name),
+                            source_index,
+                            position: package.position,
+                            has_spec: !package.is_body,
+                            has_body: package.is_body,
+                        });
+                }
+                Item::Type(type_decl) => {
+                    if first_top_level_type.is_none() {
+                        first_top_level_type = Some((source_index, type_decl_position(type_decl)));
+                    }
+                }
+                Item::Import { .. } | Item::Use { .. } => {}
+            }
+        }
+    }
+
+    let mut files = HashMap::new();
+
+    for subprogram in subprograms.values() {
+        register_split_unit_file(
+            &mut files,
+            format!("{}.ads", subprogram.stem),
+            SplitUnitFileOwner {
+                description: format!("top-level subprogram `{}`", subprogram.name),
+                source_index: subprogram.source_index,
+                position: subprogram.position,
+            },
+        )?;
+        if subprogram.has_body {
+            register_split_unit_file(
+                &mut files,
+                format!("{}.adb", subprogram.stem),
+                SplitUnitFileOwner {
+                    description: format!("top-level subprogram `{}`", subprogram.name),
+                    source_index: subprogram.source_index,
+                    position: subprogram.position,
+                },
+            )?;
+        }
+    }
+
+    for package in packages.values() {
+        if package.has_spec || package.has_body {
+            register_split_unit_file(
+                &mut files,
+                format!("{}.ads", package.stem),
+                SplitUnitFileOwner {
+                    description: format!("top-level package `{}`", package.name.as_string()),
+                    source_index: package.source_index,
+                    position: package.position,
+                },
+            )?;
+        }
+        if package.has_body {
+            register_split_unit_file(
+                &mut files,
+                format!("{}.adb", package.stem),
+                SplitUnitFileOwner {
+                    description: format!("top-level package `{}`", package.name.as_string()),
+                    source_index: package.source_index,
+                    position: package.position,
+                },
+            )?;
+        }
+    }
+
+    if let Some((source_index, position)) = first_top_level_type {
+        let support_package = split_support_package_name(fallback_stem);
+        register_split_unit_file(
+            &mut files,
+            format!("{}.ads", unit_stem_from_name(&support_package)),
+            SplitUnitFileOwner {
+                description: format!(
+                    "generated support package `{}` for top-level types",
+                    support_package.as_string()
+                ),
+                source_index,
+                position,
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+fn split_unit_subprogram_key(subprogram: &Subprogram) -> SplitUnitSubprogramKey {
+    SplitUnitSubprogramKey {
+        params: subprogram
+            .params
+            .iter()
+            .map(|param| (param.mode, param.ty.as_string()))
+            .collect(),
+        return_type: subprogram.return_type.as_ref().map(Name::as_string),
+    }
+}
+
+fn type_decl_position(type_decl: &TypeDecl) -> Position {
+    match type_decl {
+        TypeDecl::Record(record) => record.position,
+        TypeDecl::Enum(enum_type) => enum_type.position,
+        TypeDecl::Range(range_type) => range_type.position,
+        TypeDecl::Array(array_type) => array_type.position,
+    }
+}
+
+fn register_split_unit_file(
+    files: &mut HashMap<String, SplitUnitFileOwner>,
+    filename: String,
+    owner: SplitUnitFileOwner,
+) -> Result<(), IndexedDiagnostic> {
+    if let Some(existing) = files.get(&filename) {
+        return Err(IndexedDiagnostic::new(
+            owner.source_index,
+            Diagnostic::new(
+                format!(
+                    "split-unit output would write both {} and {} to `{filename}`; rename one of them or use aggregate output",
+                    existing.description, owner.description
+                ),
+                owner.position,
+            ),
+        ));
+    }
+
+    files.insert(filename, owner);
+    Ok(())
 }
 
 fn render_spec(program: &AdaProgram) -> String {
@@ -1074,7 +1431,10 @@ fn render_body(program: &AdaProgram) -> String {
     for (index, unit) in program.body_units.iter().enumerate() {
         match &unit.item {
             AdaBodyUnit::Subprogram(body) => lines.extend(render_subprogram_body(body, 0)),
-            AdaBodyUnit::Package(package) => lines.extend(render_package_body(package)),
+            AdaBodyUnit::Package(package) => lines.extend(render_package_body(
+                package,
+                find_package_spec(program, &package.name),
+            )),
         }
         if index + 1 != program.body_units.len() {
             lines.push(String::new());
@@ -1085,64 +1445,98 @@ fn render_body(program: &AdaProgram) -> String {
 }
 
 fn render_context(context: &[AdaContextItem]) -> Vec<String> {
-    context.iter().map(render_context_item).collect()
+    normalize_context_items(context)
+        .into_iter()
+        .map(|item| render_context_item(&item))
+        .collect()
 }
 
 fn render_context_for_unit(
     context: &[AdaContextItem],
+    library_units: &LibraryUnits,
     self_name: Option<&Name>,
     support_package: Option<&Name>,
     extra_withs: &[Name],
 ) -> Vec<String> {
-    let mut lines: Vec<_> = context
+    let mut items: Vec<_> = context
         .iter()
         .filter(|item| match self_name {
             Some(self_name) => item.name != *self_name,
             None => true,
         })
-        .map(render_context_item)
+        .filter(|item| !library_units.top_level_subprograms.contains(&item.name))
+        .cloned()
         .collect();
 
     for dependency in extra_withs {
         if self_name == Some(dependency) {
             continue;
         }
-        let has_with = context
+        if !items
             .iter()
-            .any(|item| item.kind == AdaContextKind::With && item.name == *dependency);
-        if !has_with {
-            lines.push(render_context_item(&AdaContextItem {
+            .any(|item| item.kind == AdaContextKind::With && item.name == *dependency)
+        {
+            items.push(AdaContextItem {
                 kind: AdaContextKind::With,
                 name: dependency.clone(),
-            }));
+            });
         }
     }
 
     if let Some(support_package) = support_package
         && self_name != Some(support_package)
     {
-        let has_with = context
+        let has_with = items
             .iter()
             .any(|item| item.kind == AdaContextKind::With && item.name == *support_package);
-        let has_use = context
+        let has_use = items
             .iter()
             .any(|item| item.kind == AdaContextKind::Use && item.name == *support_package);
 
         if !has_with {
-            lines.push(render_context_item(&AdaContextItem {
+            items.push(AdaContextItem {
                 kind: AdaContextKind::With,
                 name: support_package.clone(),
-            }));
+            });
         }
         if !has_use {
-            lines.push(render_context_item(&AdaContextItem {
+            items.push(AdaContextItem {
                 kind: AdaContextKind::Use,
                 name: support_package.clone(),
-            }));
+            });
         }
     }
 
-    lines
+    render_context(&items)
+}
+
+fn normalize_context_items(context: &[AdaContextItem]) -> Vec<AdaContextItem> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut seen_withs = HashSet::new();
+
+    for item in context {
+        if item.kind == AdaContextKind::Use && !seen_withs.contains(&item.name) {
+            let with_item = AdaContextItem {
+                kind: AdaContextKind::With,
+                name: item.name.clone(),
+            };
+            if seen.insert(with_item.clone()) {
+                items.push(with_item);
+            }
+            seen_withs.insert(item.name.clone());
+        }
+
+        if item.kind == AdaContextKind::With {
+            seen_withs.insert(item.name.clone());
+        }
+
+        if seen.insert(item.clone()) {
+            items.push(item.clone());
+        }
+    }
+
+    items
 }
 
 fn render_context_item(item: &AdaContextItem) -> String {
@@ -1171,24 +1565,91 @@ fn render_package_spec(package: &AdaPackageSpec) -> Vec<String> {
     lines
 }
 
-fn render_package_body(package: &AdaPackageBody) -> Vec<String> {
+fn render_package_body(
+    package: &AdaPackageBody,
+    visible_spec: Option<&AdaPackageSpec>,
+) -> Vec<String> {
     let mut lines = vec![format!("package body {} is", package.name.as_string())];
+    let private_specs = collect_private_package_body_specs(package, visible_spec);
+    let declaration_sections = package
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                AdaPackageBodyItem::Type(_) | AdaPackageBodyItem::Object(_)
+            )
+        })
+        .map(render_package_body_item)
+        .collect::<Vec<_>>();
+    let subprogram_sections = package
+        .items
+        .iter()
+        .filter(|item| matches!(item, AdaPackageBodyItem::Subprogram(_)))
+        .map(render_package_body_item)
+        .collect::<Vec<_>>();
 
-    for (index, item) in package.items.iter().enumerate() {
-        match item {
-            AdaPackageBodyItem::Subprogram(body) => lines.extend(render_subprogram_body(body, 1)),
-            AdaPackageBodyItem::Type(type_decl) => lines.extend(render_type_decl(type_decl, 1)),
-            AdaPackageBodyItem::Object(decl) => {
-                lines.push(format!("{}{}", indent(1), render_object_decl(decl)));
-            }
-        }
-        if index + 1 != package.items.len() {
+    let mut sections = Vec::new();
+    sections.extend(
+        private_specs
+            .iter()
+            .map(|spec| render_subprogram_spec_lines(spec, 1)),
+    );
+    sections.extend(declaration_sections);
+    sections.extend(subprogram_sections);
+
+    let section_count = sections.len();
+    for (index, section) in sections.into_iter().enumerate() {
+        lines.extend(section);
+        if index + 1 != section_count {
             lines.push(String::new());
         }
     }
 
     lines.push(format!("end {};", package.name.as_string()));
     lines
+}
+
+fn render_package_body_item(item: &AdaPackageBodyItem) -> Vec<String> {
+    match item {
+        AdaPackageBodyItem::Subprogram(body) => render_subprogram_body(body, 1),
+        AdaPackageBodyItem::Type(type_decl) => render_type_decl(type_decl, 1),
+        AdaPackageBodyItem::Object(decl) => {
+            vec![format!("{}{}", indent(1), render_object_decl(decl))]
+        }
+    }
+}
+
+fn collect_private_package_body_specs<'a>(
+    package: &'a AdaPackageBody,
+    visible_spec: Option<&AdaPackageSpec>,
+) -> Vec<&'a AdaSubprogramSpec> {
+    let visible_subprograms = visible_spec
+        .map(|spec| {
+            spec.items
+                .iter()
+                .filter_map(|item| match item {
+                    AdaPackageSpecItem::Subprogram(spec) => Some(subprogram_identity(spec)),
+                    AdaPackageSpecItem::Type(_) | AdaPackageSpecItem::Object(_) => None,
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    package
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            AdaPackageBodyItem::Subprogram(body)
+                if !visible_subprograms.contains(&subprogram_identity(&body.spec)) =>
+            {
+                Some(&body.spec)
+            }
+            AdaPackageBodyItem::Subprogram(_)
+            | AdaPackageBodyItem::Type(_)
+            | AdaPackageBodyItem::Object(_) => None,
+        })
+        .collect()
 }
 
 fn render_split_support_package(name: &Name, types: &[&AdaTypeDecl]) -> Vec<String> {
@@ -1244,6 +1705,7 @@ fn render_type_decl(type_decl: &AdaTypeDecl, indent_level: usize) -> Vec<String>
 }
 
 fn render_subprogram_body(body: &AdaSubprogramBody, indent_level: usize) -> Vec<String> {
+    let mut context = RenderContext::default();
     let base_indent = indent(indent_level);
     let declaration_indent = indent(indent_level + 1);
     let mut lines = vec![format!(
@@ -1260,7 +1722,12 @@ fn render_subprogram_body(body: &AdaSubprogramBody, indent_level: usize) -> Vec<
     }
 
     lines.push(format!("{base_indent}begin"));
-    lines.extend(render_nested_block(&body.statements, indent_level + 1));
+    lines.extend(render_nested_block(
+        &body.statements,
+        indent_level + 1,
+        &mut context,
+        None,
+    ));
     lines.push(format!("{base_indent}end {};", body.spec.name));
 
     lines
@@ -1284,10 +1751,32 @@ fn render_object_decl(declaration: &AdaObjectDecl) -> String {
     }
 }
 
-fn render_statement(statement: &AdaStatement, indent_level: usize) -> Vec<String> {
+#[derive(Debug, Default)]
+struct RenderContext {
+    next_continue_label: usize,
+}
+
+impl RenderContext {
+    fn next_continue_label(&mut self) -> String {
+        self.next_continue_label += 1;
+        format!("Continue_{}", self.next_continue_label)
+    }
+}
+
+fn render_statement(
+    statement: &AdaStatement,
+    indent_level: usize,
+    context: &mut RenderContext,
+    continue_label: Option<&str>,
+) -> Vec<String> {
     let base_indent = indent(indent_level);
     match statement {
         AdaStatement::Null => vec![format!("{base_indent}null;")],
+        AdaStatement::Exit => vec![format!("{base_indent}exit;")],
+        AdaStatement::Continue => vec![format!(
+            "{base_indent}goto {};",
+            continue_label.expect("continue should only be rendered inside a loop")
+        )],
         AdaStatement::Block {
             declarations,
             statements,
@@ -1301,7 +1790,12 @@ fn render_statement(statement: &AdaStatement, indent_level: usize) -> Vec<String
                 ));
             }
             lines.push(format!("{base_indent}begin"));
-            lines.extend(render_nested_block(statements, indent_level + 1));
+            lines.extend(render_nested_block(
+                statements,
+                indent_level + 1,
+                context,
+                continue_label,
+            ));
             lines.push(format!("{base_indent}end;"));
             lines
         }
@@ -1311,9 +1805,10 @@ fn render_statement(statement: &AdaStatement, indent_level: usize) -> Vec<String
                 render_expr(expr, 0)
             )]
         }
-        AdaStatement::Return(expr) => {
+        AdaStatement::Return(Some(expr)) => {
             vec![format!("{base_indent}return {};", render_expr(expr, 0))]
         }
+        AdaStatement::Return(None) => vec![format!("{base_indent}return;")],
         AdaStatement::Assign { target, value } => {
             vec![format!(
                 "{base_indent}{} := {};",
@@ -1322,8 +1817,12 @@ fn render_statement(statement: &AdaStatement, indent_level: usize) -> Vec<String
             )]
         }
         AdaStatement::Call(expr) => vec![format!("{base_indent}{};", render_expr(expr, 0))],
-        AdaStatement::If(if_statement) => render_if_statement(if_statement, indent_level),
-        AdaStatement::Case(case_statement) => render_case_statement(case_statement, indent_level),
+        AdaStatement::If(if_statement) => {
+            render_if_statement(if_statement, indent_level, context, continue_label)
+        }
+        AdaStatement::Case(case_statement) => {
+            render_case_statement(case_statement, indent_level, context, continue_label)
+        }
         AdaStatement::While {
             condition,
             invariants,
@@ -1339,7 +1838,7 @@ fn render_statement(statement: &AdaStatement, indent_level: usize) -> Vec<String
                 variants,
                 indent_level + 1,
             ));
-            lines.extend(render_nested_block(body, indent_level + 1));
+            lines.extend(render_loop_body(body, indent_level + 1, context));
             lines.push(format!("{base_indent}end loop;"));
             lines
         }
@@ -1361,10 +1860,69 @@ fn render_statement(statement: &AdaStatement, indent_level: usize) -> Vec<String
                 variants,
                 indent_level + 1,
             ));
-            lines.extend(render_nested_block(body, indent_level + 1));
+            lines.extend(render_loop_body(body, indent_level + 1, context));
             lines.push(format!("{base_indent}end loop;"));
             lines
         }
+    }
+}
+
+fn render_loop_body(
+    body: &[AdaStatement],
+    indent_level: usize,
+    context: &mut RenderContext,
+) -> Vec<String> {
+    let continue_label = loop_body_contains_continue(body).then(|| context.next_continue_label());
+    let mut lines = render_nested_block(body, indent_level, context, continue_label.as_deref());
+
+    if let Some(label) = continue_label {
+        let body_indent = indent(indent_level);
+        lines.push(format!("{body_indent}<<{label}>>"));
+        lines.push(format!("{body_indent}null;"));
+    }
+
+    lines
+}
+
+fn loop_body_contains_continue(statements: &[AdaStatement]) -> bool {
+    statements
+        .iter()
+        .any(statement_contains_continue_in_current_loop)
+}
+
+fn statement_contains_continue_in_current_loop(statement: &AdaStatement) -> bool {
+    match statement {
+        AdaStatement::Continue => true,
+        AdaStatement::Block { statements, .. } => loop_body_contains_continue(statements),
+        AdaStatement::If(statement) => {
+            loop_body_contains_continue(&statement.then_branch)
+                || statement
+                    .else_if_branches
+                    .iter()
+                    .any(|branch| loop_body_contains_continue(&branch.body))
+                || statement
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|branch| loop_body_contains_continue(branch))
+        }
+        AdaStatement::Case(statement) => {
+            statement
+                .arms
+                .iter()
+                .any(|arm| loop_body_contains_continue(&arm.body))
+                || statement
+                    .else_arm
+                    .as_ref()
+                    .is_some_and(|arm| loop_body_contains_continue(arm))
+        }
+        AdaStatement::Null
+        | AdaStatement::Exit
+        | AdaStatement::Assert(_)
+        | AdaStatement::Return(_)
+        | AdaStatement::Assign { .. }
+        | AdaStatement::Call(_)
+        | AdaStatement::While { .. }
+        | AdaStatement::For { .. } => false,
     }
 }
 
@@ -1397,7 +1955,12 @@ fn render_loop_annotations(
     lines
 }
 
-fn render_if_statement(statement: &AdaIfStatement, indent_level: usize) -> Vec<String> {
+fn render_if_statement(
+    statement: &AdaIfStatement,
+    indent_level: usize,
+    context: &mut RenderContext,
+    continue_label: Option<&str>,
+) -> Vec<String> {
     let indent = indent(indent_level);
     let mut lines = vec![format!(
         "{indent}if {} then",
@@ -1407,6 +1970,8 @@ fn render_if_statement(statement: &AdaIfStatement, indent_level: usize) -> Vec<S
     lines.extend(render_nested_block(
         &statement.then_branch,
         indent_level + 1,
+        context,
+        continue_label,
     ));
 
     for branch in &statement.else_if_branches {
@@ -1414,19 +1979,34 @@ fn render_if_statement(statement: &AdaIfStatement, indent_level: usize) -> Vec<S
             "{indent}elsif {} then",
             render_expr(&branch.condition, 0)
         ));
-        lines.extend(render_nested_block(&branch.body, indent_level + 1));
+        lines.extend(render_nested_block(
+            &branch.body,
+            indent_level + 1,
+            context,
+            continue_label,
+        ));
     }
 
     if let Some(else_branch) = &statement.else_branch {
         lines.push(format!("{indent}else"));
-        lines.extend(render_nested_block(else_branch, indent_level + 1));
+        lines.extend(render_nested_block(
+            else_branch,
+            indent_level + 1,
+            context,
+            continue_label,
+        ));
     }
 
     lines.push(format!("{indent}end if;"));
     lines
 }
 
-fn render_case_statement(statement: &AdaCaseStatement, indent_level: usize) -> Vec<String> {
+fn render_case_statement(
+    statement: &AdaCaseStatement,
+    indent_level: usize,
+    context: &mut RenderContext,
+    continue_label: Option<&str>,
+) -> Vec<String> {
     let base_indent = indent(indent_level);
     let arm_indent = indent(indent_level + 1);
     let mut lines = vec![format!(
@@ -1442,12 +2022,22 @@ fn render_case_statement(statement: &AdaCaseStatement, indent_level: usize) -> V
             .collect::<Vec<_>>()
             .join(" | ");
         lines.push(format!("{arm_indent}when {choices} =>"));
-        lines.extend(render_nested_block(&arm.body, indent_level + 2));
+        lines.extend(render_nested_block(
+            &arm.body,
+            indent_level + 2,
+            context,
+            continue_label,
+        ));
     }
 
     if let Some(else_arm) = &statement.else_arm {
         lines.push(format!("{arm_indent}when others =>"));
-        lines.extend(render_nested_block(else_arm, indent_level + 2));
+        lines.extend(render_nested_block(
+            else_arm,
+            indent_level + 2,
+            context,
+            continue_label,
+        ));
     }
 
     lines.push(format!("{base_indent}end case;"));
@@ -1634,6 +2224,9 @@ fn render_expr(expr: &AdaExpr, parent_precedence: u8) -> String {
         AdaExpr::String(value) => format!("\"{}\"", value.replace('"', "\"\"")),
         AdaExpr::Name(name) => name.as_string(),
         AdaExpr::Result(name) => format!("{name}'Result"),
+        AdaExpr::TypeQualified { ty, expr } => {
+            format!("{}'({})", ty.as_string(), render_expr(expr, 0))
+        }
         AdaExpr::Qualified { prefix, member } => {
             format!("{}.{}", render_expr(prefix, precedence), member)
         }
@@ -1746,6 +2339,7 @@ fn expr_precedence(expr: &AdaExpr) -> u8 {
         },
         AdaExpr::Unary { .. } => 6,
         AdaExpr::Call { .. }
+        | AdaExpr::TypeQualified { .. }
         | AdaExpr::Qualified { .. }
         | AdaExpr::Index { .. }
         | AdaExpr::Attribute { .. } => 7,
@@ -1765,14 +2359,24 @@ fn indent(level: usize) -> String {
     "   ".repeat(level)
 }
 
-fn render_nested_block(statements: &[AdaStatement], indent_level: usize) -> Vec<String> {
+fn render_nested_block(
+    statements: &[AdaStatement],
+    indent_level: usize,
+    context: &mut RenderContext,
+    continue_label: Option<&str>,
+) -> Vec<String> {
     if statements.is_empty() {
         return vec![format!("{}null;", indent(indent_level))];
     }
 
     let mut lines = Vec::new();
     for statement in statements {
-        lines.extend(render_statement(statement, indent_level));
+        lines.extend(render_statement(
+            statement,
+            indent_level,
+            context,
+            continue_label,
+        ));
     }
     lines
 }
@@ -1798,6 +2402,13 @@ fn compose_blocks(context: &[String], blocks: Vec<Vec<String>>) -> String {
     lines.join("\n")
 }
 
+fn find_package_spec<'a>(program: &'a AdaProgram, name: &Name) -> Option<&'a AdaPackageSpec> {
+    program.spec_units.iter().find_map(|unit| match &unit.item {
+        AdaSpecUnit::Package(package) if package.name == *name => Some(package),
+        AdaSpecUnit::Subprogram(_) | AdaSpecUnit::Type(_) | AdaSpecUnit::Package(_) => None,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SubprogramIdentity {
     name: String,
@@ -1817,96 +2428,93 @@ fn subprogram_identity(spec: &AdaSubprogramSpec) -> SubprogramIdentity {
     }
 }
 
-fn collect_top_level_subprogram_units(program: &AdaProgram) -> HashSet<Name> {
-    program
-        .spec_units
-        .iter()
-        .filter_map(|unit| match &unit.item {
-            AdaSpecUnit::Subprogram(spec) => Some(Name {
-                segments: vec![spec.name.clone()],
-            }),
-            AdaSpecUnit::Type(_) | AdaSpecUnit::Package(_) => None,
-        })
-        .collect()
+fn collect_library_units(program: &AdaProgram) -> LibraryUnits {
+    let mut library_units = LibraryUnits::default();
+
+    for unit in &program.spec_units {
+        match &unit.item {
+            AdaSpecUnit::Subprogram(spec) => {
+                library_units.top_level_subprograms.insert(Name {
+                    segments: vec![spec.name.clone()],
+                });
+            }
+            AdaSpecUnit::Package(package) => {
+                library_units.packages.insert(package.name.clone());
+            }
+            AdaSpecUnit::Type(_) => {}
+        }
+    }
+
+    library_units
 }
 
 fn collect_subprogram_spec_dependencies(
     spec: &AdaSubprogramSpec,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
 ) -> Vec<Name> {
     let mut dependencies = HashSet::new();
-    collect_subprogram_spec_dependency_set(spec, top_level_subprogram_units, &mut dependencies);
+    collect_subprogram_spec_dependency_set(spec, library_units, &mut dependencies);
     sort_names(dependencies)
 }
 
 fn collect_subprogram_spec_dependency_set(
     spec: &AdaSubprogramSpec,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
     dependencies: &mut HashSet<Name>,
 ) {
     for param in &spec.params {
+        collect_name_dependencies(&param.ty, library_units, dependencies);
         if let Some(default) = &param.default {
-            collect_expr_dependencies(default, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(default, library_units, dependencies);
         }
     }
+    if let Some(return_type) = &spec.return_type {
+        collect_name_dependencies(return_type, library_units, dependencies);
+    }
+    if let Some(global) = &spec.global {
+        collect_global_contract_dependencies(global, library_units, dependencies);
+    }
+    if let Some(depends) = &spec.depends {
+        collect_depends_contract_dependencies(depends, library_units, dependencies);
+    }
     for expr in &spec.preconditions {
-        collect_expr_dependencies(expr, top_level_subprogram_units, dependencies);
+        collect_expr_dependencies(expr, library_units, dependencies);
     }
     for expr in &spec.postconditions {
-        collect_expr_dependencies(expr, top_level_subprogram_units, dependencies);
+        collect_expr_dependencies(expr, library_units, dependencies);
     }
 }
 
 fn collect_subprogram_body_dependencies(
     body: &AdaSubprogramBody,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
 ) -> Vec<Name> {
     let mut dependencies = HashSet::new();
-    collect_subprogram_spec_dependency_set(
-        &body.spec,
-        top_level_subprogram_units,
-        &mut dependencies,
-    );
+    collect_subprogram_spec_dependency_set(&body.spec, library_units, &mut dependencies);
     for declaration in &body.declarations {
-        if let Some(initializer) = &declaration.initializer {
-            collect_expr_dependencies(initializer, top_level_subprogram_units, &mut dependencies);
-        }
+        collect_object_decl_dependencies(declaration, library_units, &mut dependencies);
     }
     for statement in &body.statements {
-        collect_statement_dependencies(statement, top_level_subprogram_units, &mut dependencies);
+        collect_statement_dependencies(statement, library_units, &mut dependencies);
     }
     sort_names(dependencies)
 }
 
 fn collect_package_spec_dependencies(
     package: &AdaPackageSpec,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
 ) -> Vec<Name> {
     let mut dependencies = HashSet::new();
     for item in &package.items {
         match item {
             AdaPackageSpecItem::Subprogram(spec) => {
-                collect_subprogram_spec_dependency_set(
-                    spec,
-                    top_level_subprogram_units,
-                    &mut dependencies,
-                );
+                collect_subprogram_spec_dependency_set(spec, library_units, &mut dependencies);
             }
             AdaPackageSpecItem::Object(decl) => {
-                if let Some(initializer) = &decl.initializer {
-                    collect_expr_dependencies(
-                        initializer,
-                        top_level_subprogram_units,
-                        &mut dependencies,
-                    );
-                }
+                collect_object_decl_dependencies(decl, library_units, &mut dependencies);
             }
             AdaPackageSpecItem::Type(type_decl) => {
-                collect_type_decl_dependencies(
-                    type_decl,
-                    top_level_subprogram_units,
-                    &mut dependencies,
-                );
+                collect_type_decl_dependencies(type_decl, library_units, &mut dependencies);
             }
         }
     }
@@ -1915,142 +2523,122 @@ fn collect_package_spec_dependencies(
 
 fn collect_package_body_dependencies(
     package: &AdaPackageBody,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
 ) -> Vec<Name> {
     let mut dependencies = HashSet::new();
     for item in &package.items {
         match item {
             AdaPackageBodyItem::Subprogram(body) => {
-                for dependency in
-                    collect_subprogram_body_dependencies(body, top_level_subprogram_units)
-                {
+                for dependency in collect_subprogram_body_dependencies(body, library_units) {
                     dependencies.insert(dependency);
                 }
             }
             AdaPackageBodyItem::Object(decl) => {
-                if let Some(initializer) = &decl.initializer {
-                    collect_expr_dependencies(
-                        initializer,
-                        top_level_subprogram_units,
-                        &mut dependencies,
-                    );
-                }
+                collect_object_decl_dependencies(decl, library_units, &mut dependencies);
             }
             AdaPackageBodyItem::Type(type_decl) => {
-                collect_type_decl_dependencies(
-                    type_decl,
-                    top_level_subprogram_units,
-                    &mut dependencies,
-                );
+                collect_type_decl_dependencies(type_decl, library_units, &mut dependencies);
             }
         }
     }
     sort_names(dependencies)
 }
 
+fn collect_object_decl_dependencies(
+    decl: &AdaObjectDecl,
+    library_units: &LibraryUnits,
+    dependencies: &mut HashSet<Name>,
+) {
+    collect_name_dependencies(&decl.ty, library_units, dependencies);
+    if let Some(initializer) = &decl.initializer {
+        collect_expr_dependencies(initializer, library_units, dependencies);
+    }
+}
+
 fn collect_type_decl_dependencies(
     type_decl: &AdaTypeDecl,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
     dependencies: &mut HashSet<Name>,
 ) {
     match type_decl {
+        AdaTypeDecl::Record(record) => {
+            for field in &record.fields {
+                collect_name_dependencies(&field.ty, library_units, dependencies);
+            }
+        }
         AdaTypeDecl::Range(range_type) => {
-            collect_expr_dependencies(&range_type.start, top_level_subprogram_units, dependencies);
-            collect_expr_dependencies(&range_type.end, top_level_subprogram_units, dependencies);
+            collect_name_dependencies(&range_type.base, library_units, dependencies);
+            collect_expr_dependencies(&range_type.start, library_units, dependencies);
+            collect_expr_dependencies(&range_type.end, library_units, dependencies);
         }
         AdaTypeDecl::Array(array_type) => {
-            collect_expr_dependencies(&array_type.start, top_level_subprogram_units, dependencies);
-            collect_expr_dependencies(&array_type.end, top_level_subprogram_units, dependencies);
+            collect_name_dependencies(&array_type.element_type, library_units, dependencies);
+            collect_expr_dependencies(&array_type.start, library_units, dependencies);
+            collect_expr_dependencies(&array_type.end, library_units, dependencies);
         }
-        AdaTypeDecl::Record(_) | AdaTypeDecl::Enum(_) => {}
+        AdaTypeDecl::Enum(_) => {}
     }
 }
 
 fn collect_statement_dependencies(
     statement: &AdaStatement,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
     dependencies: &mut HashSet<Name>,
 ) {
     match statement {
-        AdaStatement::Null => {}
+        AdaStatement::Null | AdaStatement::Exit | AdaStatement::Continue => {}
         AdaStatement::Block {
             declarations,
             statements,
         } => {
             for declaration in declarations {
-                if let Some(initializer) = &declaration.initializer {
-                    collect_expr_dependencies(
-                        initializer,
-                        top_level_subprogram_units,
-                        dependencies,
-                    );
-                }
+                collect_object_decl_dependencies(declaration, library_units, dependencies);
             }
             for nested in statements {
-                collect_statement_dependencies(nested, top_level_subprogram_units, dependencies);
+                collect_statement_dependencies(nested, library_units, dependencies);
             }
         }
-        AdaStatement::Assert(expr) | AdaStatement::Return(expr) | AdaStatement::Call(expr) => {
-            collect_expr_dependencies(expr, top_level_subprogram_units, dependencies);
+        AdaStatement::Assert(expr) | AdaStatement::Call(expr) => {
+            collect_expr_dependencies(expr, library_units, dependencies);
         }
+        AdaStatement::Return(Some(expr)) => {
+            collect_expr_dependencies(expr, library_units, dependencies);
+        }
+        AdaStatement::Return(None) => {}
         AdaStatement::Assign { target, value } => {
-            collect_expr_dependencies(target, top_level_subprogram_units, dependencies);
-            collect_expr_dependencies(value, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(target, library_units, dependencies);
+            collect_expr_dependencies(value, library_units, dependencies);
         }
         AdaStatement::If(statement) => {
-            collect_expr_dependencies(
-                &statement.condition,
-                top_level_subprogram_units,
-                dependencies,
-            );
+            collect_expr_dependencies(&statement.condition, library_units, dependencies);
             for nested in &statement.then_branch {
-                collect_statement_dependencies(nested, top_level_subprogram_units, dependencies);
+                collect_statement_dependencies(nested, library_units, dependencies);
             }
             for branch in &statement.else_if_branches {
-                collect_expr_dependencies(
-                    &branch.condition,
-                    top_level_subprogram_units,
-                    dependencies,
-                );
+                collect_expr_dependencies(&branch.condition, library_units, dependencies);
                 for nested in &branch.body {
-                    collect_statement_dependencies(
-                        nested,
-                        top_level_subprogram_units,
-                        dependencies,
-                    );
+                    collect_statement_dependencies(nested, library_units, dependencies);
                 }
             }
             if let Some(else_branch) = &statement.else_branch {
                 for nested in else_branch {
-                    collect_statement_dependencies(
-                        nested,
-                        top_level_subprogram_units,
-                        dependencies,
-                    );
+                    collect_statement_dependencies(nested, library_units, dependencies);
                 }
             }
         }
         AdaStatement::Case(statement) => {
-            collect_expr_dependencies(&statement.expr, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(&statement.expr, library_units, dependencies);
             for arm in &statement.arms {
                 for choice in &arm.choices {
-                    collect_expr_dependencies(choice, top_level_subprogram_units, dependencies);
+                    collect_expr_dependencies(choice, library_units, dependencies);
                 }
                 for nested in &arm.body {
-                    collect_statement_dependencies(
-                        nested,
-                        top_level_subprogram_units,
-                        dependencies,
-                    );
+                    collect_statement_dependencies(nested, library_units, dependencies);
                 }
             }
             if let Some(else_arm) = &statement.else_arm {
                 for nested in else_arm {
-                    collect_statement_dependencies(
-                        nested,
-                        top_level_subprogram_units,
-                        dependencies,
-                    );
+                    collect_statement_dependencies(nested, library_units, dependencies);
                 }
             }
         }
@@ -2060,15 +2648,15 @@ fn collect_statement_dependencies(
             variants,
             body,
         } => {
-            collect_expr_dependencies(condition, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(condition, library_units, dependencies);
             for invariant in invariants {
-                collect_expr_dependencies(invariant, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(invariant, library_units, dependencies);
             }
             for variant in variants {
-                collect_expr_dependencies(&variant.expr, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(&variant.expr, library_units, dependencies);
             }
             for nested in body {
-                collect_statement_dependencies(nested, top_level_subprogram_units, dependencies);
+                collect_statement_dependencies(nested, library_units, dependencies);
             }
         }
         AdaStatement::For {
@@ -2079,16 +2667,16 @@ fn collect_statement_dependencies(
             body,
             ..
         } => {
-            collect_expr_dependencies(start, top_level_subprogram_units, dependencies);
-            collect_expr_dependencies(end, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(start, library_units, dependencies);
+            collect_expr_dependencies(end, library_units, dependencies);
             for invariant in invariants {
-                collect_expr_dependencies(invariant, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(invariant, library_units, dependencies);
             }
             for variant in variants {
-                collect_expr_dependencies(&variant.expr, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(&variant.expr, library_units, dependencies);
             }
             for nested in body {
-                collect_statement_dependencies(nested, top_level_subprogram_units, dependencies);
+                collect_statement_dependencies(nested, library_units, dependencies);
             }
         }
     }
@@ -2096,53 +2684,137 @@ fn collect_statement_dependencies(
 
 fn collect_expr_dependencies(
     expr: &AdaExpr,
-    top_level_subprogram_units: &HashSet<Name>,
+    library_units: &LibraryUnits,
     dependencies: &mut HashSet<Name>,
 ) {
     match expr {
         AdaExpr::Call { callee, args } => {
             if let AdaExpr::Name(name) = callee.as_ref()
-                && top_level_subprogram_units.contains(name)
+                && library_units.top_level_subprograms.contains(name)
             {
                 dependencies.insert(name.clone());
             }
-            collect_expr_dependencies(callee, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(callee, library_units, dependencies);
             for arg in args {
-                collect_expr_dependencies(&arg.value, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(&arg.value, library_units, dependencies);
             }
         }
-        AdaExpr::Qualified { prefix, .. } | AdaExpr::Attribute { prefix, .. } => {
-            collect_expr_dependencies(prefix, top_level_subprogram_units, dependencies);
+        AdaExpr::TypeQualified { ty, expr } => {
+            collect_name_dependencies(ty, library_units, dependencies);
+            collect_expr_dependencies(expr, library_units, dependencies);
+        }
+        expr @ AdaExpr::Qualified { .. } => {
+            if let Some(name) = ada_expr_to_name(expr) {
+                collect_name_dependencies(&name, library_units, dependencies);
+            }
+        }
+        AdaExpr::Attribute { prefix, .. } => {
+            collect_expr_dependencies(prefix, library_units, dependencies);
         }
         AdaExpr::Index { base, index } => {
-            collect_expr_dependencies(base, top_level_subprogram_units, dependencies);
-            collect_expr_dependencies(index, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(base, library_units, dependencies);
+            collect_expr_dependencies(index, library_units, dependencies);
         }
         AdaExpr::NamedAggregate(fields) => {
             for (_, value) in fields {
-                collect_expr_dependencies(value, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(value, library_units, dependencies);
             }
         }
         AdaExpr::Aggregate(elements) => {
             for element in elements {
-                collect_expr_dependencies(element, top_level_subprogram_units, dependencies);
+                collect_expr_dependencies(element, library_units, dependencies);
             }
         }
         AdaExpr::Unary { expr, .. } => {
-            collect_expr_dependencies(expr, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(expr, library_units, dependencies);
         }
         AdaExpr::Binary { lhs, rhs, .. } => {
-            collect_expr_dependencies(lhs, top_level_subprogram_units, dependencies);
-            collect_expr_dependencies(rhs, top_level_subprogram_units, dependencies);
+            collect_expr_dependencies(lhs, library_units, dependencies);
+            collect_expr_dependencies(rhs, library_units, dependencies);
+        }
+        AdaExpr::Name(name) => collect_name_dependencies(name, library_units, dependencies),
+        AdaExpr::Bool(_)
+        | AdaExpr::Integer(_)
+        | AdaExpr::Float(_)
+        | AdaExpr::Character(_)
+        | AdaExpr::String(_)
+        | AdaExpr::Result(_) => {}
+    }
+}
+
+fn collect_name_dependencies(
+    name: &Name,
+    library_units: &LibraryUnits,
+    dependencies: &mut HashSet<Name>,
+) {
+    if let Some(package_dependency) = longest_matching_package_name(name, &library_units.packages) {
+        dependencies.insert(package_dependency);
+    }
+}
+
+fn collect_global_contract_dependencies(
+    global: &AdaGlobalContract,
+    library_units: &LibraryUnits,
+    dependencies: &mut HashSet<Name>,
+) {
+    for item in &global.items {
+        for name in &item.names {
+            collect_name_dependencies(name, library_units, dependencies);
+        }
+    }
+}
+
+fn collect_depends_contract_dependencies(
+    depends: &AdaDependsContract,
+    library_units: &LibraryUnits,
+    dependencies: &mut HashSet<Name>,
+) {
+    for item in &depends.items {
+        if let AdaDependTarget::Name(name) = &item.target {
+            collect_name_dependencies(name, library_units, dependencies);
+        }
+        for source in &item.sources {
+            collect_name_dependencies(source, library_units, dependencies);
+        }
+    }
+}
+
+fn ada_expr_to_name(expr: &AdaExpr) -> Option<Name> {
+    match expr {
+        AdaExpr::Name(name) => Some(name.clone()),
+        AdaExpr::Qualified { prefix, member } => {
+            let mut name = ada_expr_to_name(prefix)?;
+            name.segments.push(member.clone());
+            Some(name)
         }
         AdaExpr::Bool(_)
         | AdaExpr::Integer(_)
         | AdaExpr::Float(_)
         | AdaExpr::Character(_)
         | AdaExpr::String(_)
-        | AdaExpr::Name(_)
-        | AdaExpr::Result(_) => {}
+        | AdaExpr::Result(_)
+        | AdaExpr::TypeQualified { .. }
+        | AdaExpr::Index { .. }
+        | AdaExpr::Attribute { .. }
+        | AdaExpr::Call { .. }
+        | AdaExpr::NamedAggregate(_)
+        | AdaExpr::Aggregate(_)
+        | AdaExpr::Unary { .. }
+        | AdaExpr::Binary { .. } => None,
     }
+}
+
+fn longest_matching_package_name(name: &Name, packages: &HashSet<Name>) -> Option<Name> {
+    for length in (1..=name.segments.len()).rev() {
+        let candidate = Name {
+            segments: name.segments[..length].to_vec(),
+        };
+        if packages.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 fn sort_names(names: HashSet<Name>) -> Vec<Name> {

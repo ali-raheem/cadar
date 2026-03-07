@@ -37,16 +37,18 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) -> Result<Item, Diagnostic> {
         match self.current_kind() {
             TokenKind::Import => {
+                let position = self.current().position;
                 self.bump();
                 let name = self.parse_name()?;
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after import")?;
-                Ok(Item::Import(name))
+                Ok(Item::Import { name, position })
             }
             TokenKind::Use => {
+                let position = self.current().position;
                 self.bump();
                 let name = self.parse_name()?;
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after use")?;
-                Ok(Item::Use(name))
+                Ok(Item::Use { name, position })
             }
             TokenKind::Fn => Ok(Item::Subprogram(self.parse_subprogram()?)),
             TokenKind::Type => Ok(Item::Type(self.parse_type_decl()?)),
@@ -464,6 +466,16 @@ impl<'a> Parser<'a> {
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after `null`")?;
                 Ok(Statement::Null { position })
             }
+            TokenKind::Break => {
+                self.bump();
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after `break`")?;
+                Ok(Statement::Break { position })
+            }
+            TokenKind::Continue => {
+                self.bump();
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after `continue`")?;
+                Ok(Statement::Continue { position })
+            }
             TokenKind::Assert => {
                 self.bump();
                 self.expect_simple(TokenKind::LParen, "expected `(` after `assert`")?;
@@ -474,7 +486,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Return => {
                 self.bump();
-                let expr = self.parse_expr()?;
+                let expr = if self.check(&TokenKind::Semicolon) {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                };
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after return")?;
                 Ok(Statement::Return { expr, position })
             }
@@ -694,14 +710,16 @@ impl<'a> Parser<'a> {
     fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
         let mut expr = self.parse_and()?;
         loop {
-            if !self.matches_simple(&TokenKind::Or) {
-                return Ok(expr);
-            }
-
-            let op = if self.matches_simple(&TokenKind::Else) {
+            let op = if self.matches_simple(&TokenKind::OrOr) {
                 BinaryOp::ShortCircuitOr
+            } else if self.matches_simple(&TokenKind::Or) {
+                if self.matches_simple(&TokenKind::Else) {
+                    BinaryOp::ShortCircuitOr
+                } else {
+                    BinaryOp::Or
+                }
             } else {
-                BinaryOp::Or
+                return Ok(expr);
             };
 
             let rhs = self.parse_and()?;
@@ -718,14 +736,16 @@ impl<'a> Parser<'a> {
     fn parse_and(&mut self) -> Result<Expr, Diagnostic> {
         let mut expr = self.parse_equality()?;
         loop {
-            if !self.matches_simple(&TokenKind::And) {
-                return Ok(expr);
-            }
-
-            let op = if self.matches_simple(&TokenKind::Then) {
+            let op = if self.matches_simple(&TokenKind::AndAnd) {
                 BinaryOp::ShortCircuitAnd
+            } else if self.matches_simple(&TokenKind::And) {
+                if self.matches_simple(&TokenKind::Then) {
+                    BinaryOp::ShortCircuitAnd
+                } else {
+                    BinaryOp::And
+                }
             } else {
-                BinaryOp::And
+                return Ok(expr);
             };
 
             let rhs = self.parse_equality()?;

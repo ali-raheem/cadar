@@ -29,8 +29,8 @@ pub struct SourceInput<'a> {
 
 pub fn transpile_project(sources: &[SourceInput<'_>]) -> Result<AdaOutputs, IndexedDiagnostic> {
     let programs = parse_sources(sources)?;
-    sema::validate_all(&programs)?;
-    let ada_program = lowering::lower_all(programs)?;
+    let semantic_info = sema::validate_all(&programs)?;
+    let ada_program = lowering::lower_all(programs, &semantic_info)?;
     Ok(lowering::render(&ada_program))
 }
 
@@ -39,8 +39,9 @@ pub fn transpile_project_files(
     fallback_stem: &str,
 ) -> Result<Vec<GeneratedFile>, IndexedDiagnostic> {
     let programs = parse_sources(sources)?;
-    sema::validate_all(&programs)?;
-    let ada_program = lowering::lower_all(programs)?;
+    let semantic_info = sema::validate_all(&programs)?;
+    lowering::validate_split_unit_layout(&programs, fallback_stem)?;
+    let ada_program = lowering::lower_all(programs, &semantic_info)?;
     Ok(lowering::render_files(&ada_program, fallback_stem))
 }
 
@@ -59,7 +60,9 @@ fn parse_sources(sources: &[SourceInput<'_>]) -> Result<Vec<Program>, IndexedDia
 
 #[cfg(test)]
 mod tests {
-    use super::transpile;
+    use std::collections::HashMap;
+
+    use super::{SourceInput, transpile, transpile_project_files};
 
     #[test]
     fn transpiles_function_definition_to_spec_and_body() {
@@ -82,6 +85,29 @@ mod tests {
         assert_eq!(
             output.body,
             "with Text_IO;\nuse Text_IO;\n\nfunction Add(A : Integer; B : Integer) return Integer is\nbegin\n   return A + B;\nend Add;"
+        );
+    }
+
+    #[test]
+    fn transpiles_use_without_import_as_with_and_use() {
+        let output = transpile(
+            r#"
+            use Text_IO;
+
+            fn Main() {
+                Put_Line("Hello");
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(
+            output.spec,
+            "with Text_IO;\nuse Text_IO;\n\nprocedure Main;"
+        );
+        assert_eq!(
+            output.body,
+            "with Text_IO;\nuse Text_IO;\n\nprocedure Main is\nbegin\n   Put_Line(\"Hello\");\nend Main;"
         );
     }
 
@@ -174,6 +200,34 @@ mod tests {
         assert_eq!(
             output.body,
             "function CountUp(X : Integer) return Integer is\n   Value : Integer := X;\nbegin\n   while Value < 10 loop\n      Value := Value + 1;\n   end loop;\n   return Value;\nend CountUp;"
+        );
+    }
+
+    #[test]
+    fn transpiles_procedure_return_break_and_continue() {
+        let output = transpile(
+            r#"
+            fn Run() {
+                Integer Count = 0;
+                while (Count < 5) {
+                    Count = Count + 1;
+                    if (Count == 2) {
+                        continue;
+                    }
+                    if (Count == 4) {
+                        break;
+                    }
+                }
+                return;
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(output.spec, "procedure Run;");
+        assert_eq!(
+            output.body,
+            "procedure Run is\n   Count : Integer := 0;\nbegin\n   while Count < 5 loop\n      Count := Count + 1;\n      if Count = 2 then\n         goto Continue_1;\n      end if;\n      if Count = 4 then\n         exit;\n      end if;\n      <<Continue_1>>\n      null;\n   end loop;\n   return;\nend Run;"
         );
     }
 
@@ -351,6 +405,27 @@ mod tests {
     }
 
     #[test]
+    fn transpiles_c_style_boolean_operator_aliases() {
+        let output = transpile(
+            r#"
+            fn Matches(Integer Value, Boolean Failed) -> Boolean {
+                return !(Value != 40) && !Failed || false;
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(
+            output.spec,
+            "function Matches(Value : Integer; Failed : Boolean) return Boolean;"
+        );
+        assert_eq!(
+            output.body,
+            "function Matches(Value : Integer; Failed : Boolean) return Boolean is\nbegin\n   return not (Value /= 40) and then not Failed or else False;\nend Matches;"
+        );
+    }
+
+    #[test]
     fn transpiles_short_circuit_contract_expressions() {
         let output = transpile(
             r#"
@@ -398,6 +473,32 @@ mod tests {
         assert_eq!(
             output.body,
             "procedure Describe(Value : Integer) is\nbegin\n   case Value is\n      when 0 =>\n         Put_Line(\"zero\");\n      when 1 | 2 =>\n         null;\n      when others =>\n         Put_Line(\"many\");\n   end case;\nend Describe;"
+        );
+    }
+
+    #[test]
+    fn accepts_exhaustive_enum_case_returns_without_else() {
+        let output = transpile(
+            r#"
+            enum Axis { X, Y }
+
+            fn Axis_Name(Axis Selected) -> String {
+                case (Selected) {
+                    when X => {
+                        return "X axis";
+                    }
+                    when Y => {
+                        return "Y axis";
+                    }
+                }
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(
+            output.body,
+            "function Axis_Name(Selected : Axis) return String is\nbegin\n   case Selected is\n      when X =>\n         return \"X axis\";\n      when Y =>\n         return \"Y axis\";\n   end case;\nend Axis_Name;"
         );
     }
 
@@ -581,12 +682,99 @@ mod tests {
     }
 
     #[test]
+    fn rejects_case_distinct_parameter_names() {
+        let error = transpile(
+            r#"
+            fn Add(Integer Value, Integer value) -> Integer {
+                return Value;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "parameter `value` differs only by case from `Value`; Ada identifiers are case-insensitive"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_case_distinct_local_declarations() {
+        let error = transpile(
+            r#"
+            fn Main() {
+                Integer Count = 1;
+                Integer count = 2;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "local declaration `count` differs only by case from `Count`; Ada identifiers are case-insensitive"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_case_distinct_top_level_package_names() {
+        let error = transpile(
+            r#"
+            package Math {
+            }
+
+            package math {
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "top-level package `math` differs only by case from `Math`; Ada identifiers are case-insensitive"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_case_distinct_top_level_subprogram_names() {
+        let error = transpile(
+            r#"
+            fn Parse(Integer Value) -> Integer {
+                return Value;
+            }
+
+            fn parse(Boolean Value) -> Boolean {
+                return Value;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "top-level subprogram `parse` differs only by case from `Parse`; Ada identifiers are case-insensitive"
+            ) || error.message.contains(
+                "subprogram `parse` differs only by case from `Parse`; Ada identifiers are case-insensitive"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn rejects_call_arity_mismatch_for_known_subprogram() {
         let error = transpile(
             r#"
             fn Add(Integer A, Integer B) -> Integer {
                 return A + B;
             }
+
+            import Add;
 
             fn Main() {
                 Add(1);
@@ -656,6 +844,248 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unimported_package_qualified_call() {
+        let error = transpile(
+            r#"
+            package Math {
+                fn Add(Integer A, Integer B) -> Integer;
+            }
+
+            package body Math {
+                fn Add(Integer A, Integer B) -> Integer {
+                    return A + B;
+                }
+            }
+
+            fn Main() -> Integer {
+                return Math.Add(2, 3);
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("package `Math` is not visible; add `import Math;` or `use Math;`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unimported_top_level_subprogram_call() {
+        let error = transpile(
+            r#"
+            fn Adjust(Integer Value) -> Integer {
+                return Value + 1;
+            }
+
+            fn Main() -> Integer {
+                return Adjust(2);
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("top-level subprogram `Adjust` is not visible; add `import Adjust;`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_use_of_top_level_subprogram() {
+        let error = transpile(
+            r#"
+            use Adjust;
+
+            fn Adjust(Integer Value) -> Integer {
+                return Value + 1;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "`use Adjust` is not valid because `Adjust` is a top-level subprogram; use `import Adjust;` and call it explicitly"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_import_of_top_level_type() {
+        let error = transpile(
+            r#"
+            import Buffer;
+
+            type Buffer = [0..3] Integer;
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "`import Buffer` is not valid because `Buffer` is a top-level type, not a library unit"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn allows_recursive_top_level_function_without_import() {
+        let output = transpile(
+            r#"
+            fn Factorial(Integer Value) -> Integer {
+                if (Value == 0) {
+                    return 1;
+                }
+
+                return Value * Factorial(Value - 1);
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output.body.contains("return Value * Factorial(Value - 1);"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_use_visible_package_value_name() {
+        let error = transpile(
+            r#"
+            package Left {
+                const Integer Value = 1;
+            }
+
+            package Right {
+                const Integer Value = 2;
+            }
+
+            use Left;
+            use Right;
+
+            fn Main() {
+                Integer Count = Value;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("identifier `Value` is ambiguous via `use` of packages `Left`, `Right`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_use_visible_type_name() {
+        let error = transpile(
+            r#"
+            package Left {
+                type Count = Integer range 0..10;
+            }
+
+            package Right {
+                type Count = Integer range 0..20;
+            }
+
+            use Left;
+            use Right;
+
+            fn Main() {
+                Count Value = 1;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("type `Count` is ambiguous via `use` of packages `Left`, `Right`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_use_visible_enum_literal() {
+        let error = transpile(
+            r#"
+            package Left {
+                enum Color { Red }
+            }
+
+            package Right {
+                enum Shade { Red }
+            }
+
+            use Left;
+            use Right;
+
+            fn Main() {
+                Left.Color Value = Red;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "enum literal `Red` is ambiguous between types `Left.Color`, `Right.Shade`"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_use_visible_subprogram_call() {
+        let error = transpile(
+            r#"
+            package Left {
+                fn Tick(Integer Value) -> Integer;
+            }
+
+            package Right {
+                fn Tick(Integer Value) -> Integer;
+            }
+
+            use Left;
+            use Right;
+
+            fn Main() {
+                Integer Value = Tick(1);
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("call to `Tick` is ambiguous between"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.message.contains("`Left.Tick(Integer) -> Integer`"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.message.contains("`Right.Tick(Integer) -> Integer`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn transpiles_package_body_private_helper_subprograms() {
         let output = transpile(
             r#"
@@ -702,6 +1132,78 @@ mod tests {
             output.body.contains("return Clamp(A) + Clamp(B);"),
             "unexpected body: {}",
             output.body
+        );
+    }
+
+    #[test]
+    fn renders_forward_declaration_for_later_private_package_helper() {
+        let output = transpile(
+            r#"
+            package Math {
+                fn Add(Integer A, Integer B) -> Integer;
+            }
+
+            package body Math {
+                fn Add(Integer A, Integer B) -> Integer {
+                    return Clamp(A) + Clamp(B);
+                }
+
+                fn Clamp(Integer Value) -> Integer {
+                    return Value;
+                }
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output
+                .body
+                .contains("function Clamp(Value : Integer) return Integer;"),
+            "unexpected body: {}",
+            output.body
+        );
+        assert!(
+            output
+                .body
+                .contains("function Add(A : Integer; B : Integer) return Integer is"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn hoists_later_package_body_declarations_before_subprogram_bodies() {
+        let output = transpile(
+            r#"
+            package Math {
+                fn Get() -> Integer;
+            }
+
+            package body Math {
+                fn Get() -> Integer {
+                    Hidden Value;
+                    Value.X = Local_Count;
+                    return Value.X;
+                }
+
+                Integer Local_Count = 7;
+
+                type Hidden = record {
+                    Integer X;
+                };
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(
+            output.spec,
+            "package Math is\n   function Get return Integer;\nend Math;"
+        );
+        assert_eq!(
+            output.body,
+            "package body Math is\n   Local_Count : Integer := 7;\n\n   type Hidden is record\n      X : Integer;\n   end record;\n\n   function Get return Integer is\n      Value : Hidden;\n   begin\n      Value.X := Local_Count;\n      return Value.X;\n   end Get;\nend Math;"
         );
     }
 
@@ -755,6 +1257,62 @@ mod tests {
             error
                 .message
                 .contains("package body `Math` is missing a definition for `Add`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_package_spec_using_body_only_type_in_public_signature() {
+        let error = transpile(
+            r#"
+            package Math {
+                fn Make() -> Hidden;
+            }
+
+            package body Math {
+                type Hidden = record {
+                    Integer Value;
+                };
+
+                fn Make() -> Hidden {
+                    Hidden Result;
+                    return Result;
+                }
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("type `Hidden` is not visible in subprogram return type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_body_only_package_public_signature_using_body_local_type() {
+        let error = transpile(
+            r#"
+            package body Math {
+                type Hidden = record {
+                    Integer Value;
+                };
+
+                fn Make() -> Hidden {
+                    Hidden Result;
+                    return Result;
+                }
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("type `Hidden` is not visible in subprogram return type"),
             "unexpected error: {error}"
         );
     }
@@ -1089,12 +1647,105 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bare_return_in_function() {
+        let error = transpile(
+            r#"
+            fn Main() -> Integer {
+                return;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains("functions must return a value"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_function_that_may_fall_through_without_return() {
+        let error = transpile(
+            r#"
+            fn Main(Boolean Ready) -> Integer {
+                if (Ready) {
+                    return 1;
+                }
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("function `Main` may complete without returning a value"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_return_value_in_procedure() {
+        let error = transpile(
+            r#"
+            fn Main() {
+                return 1;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains("procedures cannot return a value"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_break_outside_loop() {
+        let error = transpile(
+            r#"
+            fn Main() {
+                break;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains("`break` is only valid inside loops"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_continue_outside_loop() {
+        let error = transpile(
+            r#"
+            fn Main() {
+                continue;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("`continue` is only valid inside loops"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn rejects_function_call_used_as_statement() {
         let error = transpile(
             r#"
             fn Add(Integer A, Integer B) -> Integer {
                 return A + B;
             }
+
+            import Add;
 
             fn Main() {
                 Add(1, 2);
@@ -1118,6 +1769,8 @@ mod tests {
             fn Log() {
                 null;
             }
+
+            import Log;
 
             fn Main() {
                 Integer Value = Log();
@@ -1282,6 +1935,8 @@ mod tests {
                 return Value + 1;
             }
 
+            import Add;
+
             fn Main() {
                 Boolean Ready = true;
                 Integer Result = Add(Ready);
@@ -1310,6 +1965,8 @@ mod tests {
                 return Enabled;
             }
 
+            import Log;
+
             fn Main() {
                 Log(true);
             }
@@ -1322,6 +1979,377 @@ mod tests {
                 .message
                 .contains("function calls cannot be used as standalone statements"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolves_overloaded_call_by_expected_assignment_type() {
+        let output = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            import Parse;
+
+            fn Main() {
+                Integer Count = Parse("42");
+                Boolean Ready = Parse("ok");
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output
+                .body
+                .contains("Count : Integer := Integer'(Parse(\"42\"));"),
+            "unexpected body: {}",
+            output.body
+        );
+        assert!(
+            output
+                .body
+                .contains("Ready : Boolean := Boolean'(Parse(\"ok\"));"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn resolves_overloaded_call_by_expected_parameter_type() {
+        let output = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            fn Show(Boolean Ready) {
+                null;
+            }
+
+            import Parse;
+            import Show;
+
+            fn Main() {
+                Show(Parse("ok"));
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output.body.contains("Show(Boolean'(Parse(\"ok\")));"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn resolves_overloaded_call_by_boolean_operator_context() {
+        let output = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            import Parse;
+
+            fn Main() -> Boolean {
+                return not Parse("ok") or Parse("again");
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output
+                .body
+                .contains("return not Boolean'(Parse(\"ok\")) or Boolean'(Parse(\"again\"));"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn resolves_overloaded_call_by_numeric_operator_context() {
+        let output = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            import Parse;
+
+            fn Main() -> Integer {
+                return Parse("42") + 1;
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output.body.contains("return Integer'(Parse(\"42\")) + 1;"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn resolves_overloaded_call_by_comparison_context() {
+        let output = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            import Parse;
+
+            fn Main() -> Boolean {
+                return Parse("42") == 1;
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output.body.contains("return Integer'(Parse(\"42\")) = 1;"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn rejects_non_boolean_overloaded_call_in_boolean_context() {
+        let error = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> String {
+                return "bad";
+            }
+
+            import Parse;
+
+            fn Main() -> Boolean {
+                return Parse("x") and true;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "no matching overload for `Parse` with argument types (String) and expected return type `Boolean`"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_overloaded_call_in_numeric_context() {
+        let error = transpile(
+            r#"
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+
+            fn Parse(String Text) -> String {
+                return "bad";
+            }
+
+            import Parse;
+
+            fn Main() -> Integer {
+                return Parse("x") + 1;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "no matching overload for `Parse` with argument types (String) in a numeric context"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn split_unit_files_reject_top_level_overloaded_subprograms() {
+        let error = transpile_project_files(
+            &[SourceInput {
+                source: r#"
+                fn Parse(String Text) -> Integer {
+                    return 1;
+                }
+
+                fn Parse(String Text) -> Boolean {
+                    return true;
+                }
+                "#,
+            }],
+            "demo",
+        )
+        .expect_err("split-unit transpile should fail");
+
+        assert_eq!(error.source_index, 0);
+        assert!(
+            error.diagnostic.message.contains(
+                "split-unit output does not support overloaded top-level subprograms like `Parse`"
+            ),
+            "unexpected error: {}",
+            error.diagnostic
+        );
+    }
+
+    #[test]
+    fn split_unit_files_reject_top_level_package_and_subprogram_name_collision() {
+        let error = transpile_project_files(
+            &[SourceInput {
+                source: r#"
+                package Math {
+                    fn Add(Integer A, Integer B) -> Integer;
+                }
+
+                fn Math() {
+                    null;
+                }
+                "#,
+            }],
+            "demo",
+        )
+        .expect_err("split-unit transpile should fail");
+
+        assert_eq!(error.source_index, 0);
+        assert!(
+            error.diagnostic.message.contains(
+                "split-unit output would write both top-level package `Math` and top-level subprogram `Math` to `math.ads`"
+            ) || error
+                .diagnostic
+                .message
+                .contains(
+                    "split-unit output would write both top-level subprogram `Math` and top-level package `Math` to `math.ads`"
+                ),
+            "unexpected error: {}",
+            error.diagnostic
+        );
+    }
+
+    #[test]
+    fn split_unit_files_scope_top_level_subprogram_imports_per_unit() {
+        let files = transpile_project_files(
+            &[SourceInput {
+                source: r#"
+                import Add;
+                import Show;
+
+                fn Add(Integer A, Integer B) -> Integer {
+                    return A + B;
+                }
+
+                fn Show(Integer Value) {
+                    null;
+                }
+
+                fn Main() {
+                    Show(Add(2, 3));
+                }
+                "#,
+            }],
+            "demo",
+        )
+        .expect("split-unit transpile should succeed");
+
+        let files_by_name: HashMap<_, _> = files
+            .into_iter()
+            .map(|file| (file.filename, file.contents))
+            .collect();
+
+        assert_eq!(
+            files_by_name
+                .get("add.ads")
+                .expect("add spec should be emitted"),
+            "function Add(A : Integer; B : Integer) return Integer;"
+        );
+        assert_eq!(
+            files_by_name
+                .get("show.ads")
+                .expect("show spec should be emitted"),
+            "procedure Show(Value : Integer);"
+        );
+        assert_eq!(
+            files_by_name
+                .get("main.adb")
+                .expect("main body should be emitted"),
+            "with Add;\nwith Show;\n\nprocedure Main is\nbegin\n   Show(Add(2, 3));\nend Main;"
+        );
+    }
+
+    #[test]
+    fn aggregate_output_allows_top_level_overloaded_subprograms() {
+        let output = transpile(
+            r#"
+            fn Parse(String Text) -> Integer {
+                return 1;
+            }
+
+            fn Parse(String Text) -> Boolean {
+                return true;
+            }
+            "#,
+        )
+        .expect("aggregate transpile should succeed");
+
+        assert!(
+            output
+                .spec
+                .contains("function Parse(Text : String) return Integer;"),
+            "unexpected spec: {}",
+            output.spec
+        );
+        assert!(
+            output
+                .spec
+                .contains("function Parse(Text : String) return Boolean;"),
+            "unexpected spec: {}",
+            output.spec
+        );
+        assert!(
+            output
+                .body
+                .contains("function Parse(Text : String) return Integer is"),
+            "unexpected body: {}",
+            output.body
+        );
+        assert!(
+            output
+                .body
+                .contains("function Parse(Text : String) return Boolean is"),
+            "unexpected body: {}",
+            output.body
         );
     }
 
@@ -1431,6 +2459,8 @@ mod tests {
                 return Value * Factor;
             }
 
+            import Scale;
+
             fn Main() -> Integer {
                 return Scale(Factor = 3, Value = 4);
             }
@@ -1440,11 +2470,11 @@ mod tests {
 
         assert_eq!(
             output.spec,
-            "function Scale(Value : Integer; Factor : Integer := 10) return Integer;\n\nfunction Main return Integer;"
+            "with Scale;\n\nfunction Scale(Value : Integer; Factor : Integer := 10) return Integer;\n\nfunction Main return Integer;"
         );
         assert_eq!(
             output.body,
-            "function Scale(Value : Integer; Factor : Integer := 10) return Integer is\nbegin\n   return Value * Factor;\nend Scale;\n\nfunction Main return Integer is\nbegin\n   return Scale(Factor => 3, Value => 4);\nend Main;"
+            "with Scale;\n\nfunction Scale(Value : Integer; Factor : Integer := 10) return Integer is\nbegin\n   return Value * Factor;\nend Scale;\n\nfunction Main return Integer is\nbegin\n   return Scale(Factor => 3, Value => 4);\nend Main;"
         );
     }
 
@@ -1455,6 +2485,8 @@ mod tests {
             fn Scale(Integer Value, Integer Factor = 10) -> Integer {
                 return Value * Factor;
             }
+
+            import Scale;
 
             fn Main() -> Integer {
                 return Scale(4);
@@ -1541,6 +2573,8 @@ mod tests {
                 Result = Input;
             }
 
+            import Write;
+
             fn Main() {
                 Write(1, 2);
             }
@@ -1613,6 +2647,8 @@ mod tests {
     fn transpiles_qualified_package_object_access() {
         let output = transpile(
             r#"
+            import State;
+
             package State {
                 Integer Count = 2;
             }
@@ -1641,6 +2677,9 @@ mod tests {
 
             fn Touch() {
             }
+
+            import Next;
+            import Touch;
 
             fn Main() -> Integer {
                 Touch();
