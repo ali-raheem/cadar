@@ -74,7 +74,8 @@ The current compiler is a real end-to-end pipeline:
   helper subprograms, and derived specs for body-only packages
 - contracts with `requires(...)` and `ensures(...)`
 - record types, enum types, and range subtypes
-- constrained arrays, array literals, and indexing
+- record aggregates, constrained arrays, array literals, indexing, and nested
+  aggregates such as arrays of records and arrays of arrays
 - float and character literals
 - qualified names and a small attribute surface such as `Integer.image(X)`
 - named call arguments and defaulted parameters
@@ -105,6 +106,10 @@ Important current limit:
   `import Name;` before calling another library-unit subprogram like `Name(...)`
 - `use` is for packages in the supported CADA surface; do not write `use Name;`
   for top-level subprograms or top-level types
+- `import` / `use` should name library units or packages, not package members
+  like `Math.Add` or `State.Count`
+- `import` / `use` clauses should stay at the top of a source file, before any
+  top-level declarations
 
 ## What Is Left To Do
 

@@ -36,5 +36,9 @@ the calling source so visibility matches Ada library-unit behavior.
   single-quoted `Character` literals.
 - `16_loop_control.cada`: procedure `return;` plus loop `break;` and
   `continue;`, lowered to Ada `return;`, `exit;`, and `continue;`.
+- `17_arrays_of_records.cada`: package-based arrays of records, nested
+  aggregates, indexing, and qualified type construction.
+- `18_matrix_trace.cada`: nested array types, matrix-style nested array
+  aggregates, chained indexing, and loop-based computation.
 
 Expected stdout for each example lives in the matching `.stdout` file.

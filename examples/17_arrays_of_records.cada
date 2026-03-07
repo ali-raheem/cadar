@@ -1,0 +1,41 @@
+import Text_IO;
+use Text_IO;
+import Geometry;
+
+package Geometry {
+    type Point = record {
+        Integer X;
+        Integer Y;
+    };
+
+    type Point_Array = [0..1] Point;
+
+    type Segment = record {
+        Point_Array Points;
+        Integer Count;
+    };
+
+    fn Total(Segment Value) -> Integer;
+}
+
+package body Geometry {
+    fn Total(Segment Value) -> Integer {
+        return Value.Points[0].X
+            + Value.Points[0].Y
+            + Value.Points[1].X
+            + Value.Points[1].Y
+            + Value.Count;
+    }
+}
+
+fn Main() {
+    Geometry.Segment Value = Geometry.Segment {
+        Points = [
+            Geometry.Point { X = 1, Y = 2 },
+            Geometry.Point { X = 3, Y = 4 }
+        ],
+        Count = 2
+    };
+
+    Put_Line(Integer.image(Geometry.Total(Value)));
+}

@@ -374,6 +374,88 @@ fn split_units_rejects_use_of_top_level_subprogram() {
 }
 
 #[test]
+fn split_units_rejects_import_of_known_package_member() {
+    let root = temp_test_dir("split-import-package-member");
+    let input_path = root.join("bundle.cada");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Math.Add;
+
+        package Math {
+            fn Add(Integer A, Integer B) -> Integer;
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "`import Math.Add` is not valid because `Math.Add` names a member of package `Math`; import the package instead"
+        ),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_rejects_late_import_clause() {
+    let root = temp_test_dir("split-late-import");
+    let input_path = root.join("bundle.cada");
+
+    fs::write(
+        &input_path,
+        r#"
+        fn Main() {
+            null;
+        }
+
+        import Text_IO;
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`import` clauses must appear before top-level declarations"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("--> {}:6:", input_path.display())),
+        "unexpected stderr: {stderr}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
 fn split_units_adds_with_clause_for_called_top_level_subprogram() {
     let root = temp_test_dir("split-top-level-call-imported");
     let input_path = root.join("bundle.cada");

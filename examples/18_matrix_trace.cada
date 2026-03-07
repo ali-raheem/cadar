@@ -1,0 +1,28 @@
+import Text_IO;
+use Text_IO;
+import Math;
+
+package Math {
+    type Row = [0..1] Integer;
+    type Matrix = [0..1] Row;
+    fn Trace(Matrix Value) -> Integer;
+}
+
+package body Math {
+    fn Trace(Matrix Value) -> Integer {
+        Integer Total = 0;
+        for (Integer I in 0..1) {
+            Total = Total + Value[I][I];
+        }
+        return Total;
+    }
+}
+
+fn Main() {
+    Math.Matrix Value = [
+        [1, 2],
+        [3, 4]
+    ];
+
+    Put_Line(Integer.image(Math.Trace(Value)));
+}

@@ -28,6 +28,8 @@ fn gnat_compiles_and_runs_repository_examples() {
         "14_nested_block_locals",
         "15_float_and_character_literals",
         "16_loop_control",
+        "17_arrays_of_records",
+        "18_matrix_trace",
     ] {
         run_repository_example(stem);
     }

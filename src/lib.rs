@@ -770,11 +770,11 @@ mod tests {
     fn rejects_call_arity_mismatch_for_known_subprogram() {
         let error = transpile(
             r#"
+            import Add;
+
             fn Add(Integer A, Integer B) -> Integer {
                 return A + B;
             }
-
-            import Add;
 
             fn Main() {
                 Add(1);
@@ -936,6 +936,90 @@ mod tests {
     }
 
     #[test]
+    fn rejects_import_of_known_package_member() {
+        let error = transpile(
+            r#"
+            import Math.Add;
+
+            package Math {
+                fn Add(Integer A, Integer B) -> Integer;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "`import Math.Add` is not valid because `Math.Add` names a member of package `Math`; import the package instead"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_use_of_known_package_member() {
+        let error = transpile(
+            r#"
+            use Math.Count;
+
+            package Math {
+                Integer Count = 0;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "`use Math.Count` is not valid because `Math.Count` names a member of package `Math`; use the package instead"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_import_after_top_level_declaration() {
+        let error = transpile(
+            r#"
+            fn Main() {
+                null;
+            }
+
+            import Text_IO;
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("`import` clauses must appear before top-level declarations"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_use_after_top_level_declaration() {
+        let error = transpile(
+            r#"
+            fn Main() {
+                null;
+            }
+
+            use Text_IO;
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("`use` clauses must appear before top-level declarations"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn allows_recursive_top_level_function_without_import() {
         let output = transpile(
             r#"
@@ -961,6 +1045,9 @@ mod tests {
     fn rejects_ambiguous_use_visible_package_value_name() {
         let error = transpile(
             r#"
+            use Left;
+            use Right;
+
             package Left {
                 const Integer Value = 1;
             }
@@ -968,9 +1055,6 @@ mod tests {
             package Right {
                 const Integer Value = 2;
             }
-
-            use Left;
-            use Right;
 
             fn Main() {
                 Integer Count = Value;
@@ -991,6 +1075,9 @@ mod tests {
     fn rejects_ambiguous_use_visible_type_name() {
         let error = transpile(
             r#"
+            use Left;
+            use Right;
+
             package Left {
                 type Count = Integer range 0..10;
             }
@@ -998,9 +1085,6 @@ mod tests {
             package Right {
                 type Count = Integer range 0..20;
             }
-
-            use Left;
-            use Right;
 
             fn Main() {
                 Count Value = 1;
@@ -1021,6 +1105,9 @@ mod tests {
     fn rejects_ambiguous_use_visible_enum_literal() {
         let error = transpile(
             r#"
+            use Left;
+            use Right;
+
             package Left {
                 enum Color { Red }
             }
@@ -1028,9 +1115,6 @@ mod tests {
             package Right {
                 enum Shade { Red }
             }
-
-            use Left;
-            use Right;
 
             fn Main() {
                 Left.Color Value = Red;
@@ -1051,6 +1135,9 @@ mod tests {
     fn rejects_ambiguous_use_visible_subprogram_call() {
         let error = transpile(
             r#"
+            use Left;
+            use Right;
+
             package Left {
                 fn Tick(Integer Value) -> Integer;
             }
@@ -1058,9 +1145,6 @@ mod tests {
             package Right {
                 fn Tick(Integer Value) -> Integer;
             }
-
-            use Left;
-            use Right;
 
             fn Main() {
                 Integer Value = Tick(1);
@@ -1741,11 +1825,11 @@ mod tests {
     fn rejects_function_call_used_as_statement() {
         let error = transpile(
             r#"
+            import Add;
+
             fn Add(Integer A, Integer B) -> Integer {
                 return A + B;
             }
-
-            import Add;
 
             fn Main() {
                 Add(1, 2);
@@ -1766,11 +1850,11 @@ mod tests {
     fn rejects_procedure_used_as_value() {
         let error = transpile(
             r#"
+            import Log;
+
             fn Log() {
                 null;
             }
-
-            import Log;
 
             fn Main() {
                 Integer Value = Log();
@@ -1931,11 +2015,11 @@ mod tests {
     fn rejects_call_argument_type_mismatch_for_known_subprogram() {
         let error = transpile(
             r#"
+            import Add;
+
             fn Add(Integer Value) -> Integer {
                 return Value + 1;
             }
-
-            import Add;
 
             fn Main() {
                 Boolean Ready = true;
@@ -1957,6 +2041,8 @@ mod tests {
     fn rejects_function_overload_used_as_statement_when_args_select_function() {
         let error = transpile(
             r#"
+            import Log;
+
             fn Log(Integer Value) {
                 null;
             }
@@ -1964,8 +2050,6 @@ mod tests {
             fn Log(Boolean Enabled) -> Boolean {
                 return Enabled;
             }
-
-            import Log;
 
             fn Main() {
                 Log(true);
@@ -1986,6 +2070,8 @@ mod tests {
     fn resolves_overloaded_call_by_expected_assignment_type() {
         let output = transpile(
             r#"
+            import Parse;
+
             fn Parse(String Text) -> Integer {
                 return 1;
             }
@@ -1993,8 +2079,6 @@ mod tests {
             fn Parse(String Text) -> Boolean {
                 return true;
             }
-
-            import Parse;
 
             fn Main() {
                 Integer Count = Parse("42");
@@ -2024,6 +2108,9 @@ mod tests {
     fn resolves_overloaded_call_by_expected_parameter_type() {
         let output = transpile(
             r#"
+            import Parse;
+            import Show;
+
             fn Parse(String Text) -> Integer {
                 return 1;
             }
@@ -2035,9 +2122,6 @@ mod tests {
             fn Show(Boolean Ready) {
                 null;
             }
-
-            import Parse;
-            import Show;
 
             fn Main() {
                 Show(Parse("ok"));
@@ -2057,6 +2141,8 @@ mod tests {
     fn resolves_overloaded_call_by_boolean_operator_context() {
         let output = transpile(
             r#"
+            import Parse;
+
             fn Parse(String Text) -> Integer {
                 return 1;
             }
@@ -2064,8 +2150,6 @@ mod tests {
             fn Parse(String Text) -> Boolean {
                 return true;
             }
-
-            import Parse;
 
             fn Main() -> Boolean {
                 return not Parse("ok") or Parse("again");
@@ -2087,6 +2171,8 @@ mod tests {
     fn resolves_overloaded_call_by_numeric_operator_context() {
         let output = transpile(
             r#"
+            import Parse;
+
             fn Parse(String Text) -> Integer {
                 return 1;
             }
@@ -2094,8 +2180,6 @@ mod tests {
             fn Parse(String Text) -> Boolean {
                 return true;
             }
-
-            import Parse;
 
             fn Main() -> Integer {
                 return Parse("42") + 1;
@@ -2115,6 +2199,8 @@ mod tests {
     fn resolves_overloaded_call_by_comparison_context() {
         let output = transpile(
             r#"
+            import Parse;
+
             fn Parse(String Text) -> Integer {
                 return 1;
             }
@@ -2122,8 +2208,6 @@ mod tests {
             fn Parse(String Text) -> Boolean {
                 return true;
             }
-
-            import Parse;
 
             fn Main() -> Boolean {
                 return Parse("42") == 1;
@@ -2143,6 +2227,8 @@ mod tests {
     fn rejects_non_boolean_overloaded_call_in_boolean_context() {
         let error = transpile(
             r#"
+            import Parse;
+
             fn Parse(String Text) -> Integer {
                 return 1;
             }
@@ -2150,8 +2236,6 @@ mod tests {
             fn Parse(String Text) -> String {
                 return "bad";
             }
-
-            import Parse;
 
             fn Main() -> Boolean {
                 return Parse("x") and true;
@@ -2172,6 +2256,8 @@ mod tests {
     fn rejects_non_numeric_overloaded_call_in_numeric_context() {
         let error = transpile(
             r#"
+            import Parse;
+
             fn Parse(String Text) -> Boolean {
                 return true;
             }
@@ -2179,8 +2265,6 @@ mod tests {
             fn Parse(String Text) -> String {
                 return "bad";
             }
-
-            import Parse;
 
             fn Main() -> Integer {
                 return Parse("x") + 1;
@@ -2385,6 +2469,129 @@ mod tests {
     }
 
     #[test]
+    fn transpiles_arrays_of_records_and_nested_aggregates() {
+        let output = transpile(
+            r#"
+            import Geometry;
+
+            package Geometry {
+                type Point = record {
+                    Integer X;
+                    Integer Y;
+                };
+                type Point_Array = [0..1] Point;
+                type Segment = record {
+                    Point_Array Points;
+                    Integer Count;
+                };
+                fn Total(Segment Value) -> Integer;
+            }
+
+            package body Geometry {
+                fn Total(Segment Value) -> Integer {
+                    return Value.Points[0].X
+                        + Value.Points[0].Y
+                        + Value.Points[1].X
+                        + Value.Points[1].Y
+                        + Value.Count;
+                }
+            }
+
+            fn Build() -> Geometry.Segment {
+                return Geometry.Segment {
+                    Points = [
+                        Geometry.Point { X = 1, Y = 2 },
+                        Geometry.Point { X = 3, Y = 4 }
+                    ],
+                    Count = 2
+                };
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output
+                .spec
+                .contains("type Point_Array is array (0 .. 1) of Point;"),
+            "unexpected spec: {}",
+            output.spec
+        );
+        assert!(
+            output
+                .spec
+                .contains("type Segment is record\n      Points : Point_Array;\n      Count : Integer;\n   end record;"),
+            "unexpected spec: {}",
+            output.spec
+        );
+        assert!(
+            output
+                .body
+                .contains("return (Points => ((X => 1, Y => 2), (X => 3, Y => 4)), Count => 2);"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
+    fn transpiles_arrays_of_arrays_and_nested_array_aggregates() {
+        let output = transpile(
+            r#"
+            import Math;
+
+            package Math {
+                type Row = [0..1] Integer;
+                type Matrix = [0..1] Row;
+                fn Trace(Matrix Value) -> Integer;
+            }
+
+            package body Math {
+                fn Trace(Matrix Value) -> Integer {
+                    Integer Total = 0;
+                    for (Integer I in 0..1) {
+                        Total = Total + Value[I][I];
+                    }
+                    return Total;
+                }
+            }
+
+            fn Build() -> Math.Matrix {
+                return [
+                    [1, 2],
+                    [3, 4]
+                ];
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert!(
+            output
+                .spec
+                .contains("type Row is array (0 .. 1) of Integer;"),
+            "unexpected spec: {}",
+            output.spec
+        );
+        assert!(
+            output
+                .spec
+                .contains("type Matrix is array (0 .. 1) of Row;"),
+            "unexpected spec: {}",
+            output.spec
+        );
+        assert!(
+            output.body.contains("return ((1, 2), (3, 4));"),
+            "unexpected body: {}",
+            output.body
+        );
+        assert!(
+            output.body.contains("Total := Total + Value(I)(I);"),
+            "unexpected body: {}",
+            output.body
+        );
+    }
+
+    #[test]
     fn rejects_record_aggregate_missing_field() {
         let error = transpile(
             r#"
@@ -2455,11 +2662,11 @@ mod tests {
     fn transpiles_named_arguments_and_default_parameters() {
         let output = transpile(
             r#"
+            import Scale;
+
             fn Scale(Integer Value, Integer Factor = 10) -> Integer {
                 return Value * Factor;
             }
-
-            import Scale;
 
             fn Main() -> Integer {
                 return Scale(Factor = 3, Value = 4);
@@ -2482,11 +2689,11 @@ mod tests {
     fn allows_omitting_defaulted_parameters_in_calls() {
         let output = transpile(
             r#"
+            import Scale;
+
             fn Scale(Integer Value, Integer Factor = 10) -> Integer {
                 return Value * Factor;
             }
-
-            import Scale;
 
             fn Main() -> Integer {
                 return Scale(4);
@@ -2569,11 +2776,11 @@ mod tests {
     fn rejects_non_assignable_out_argument() {
         let error = transpile(
             r#"
+            import Write;
+
             fn Write(Integer Input; Integer Result) {
                 Result = Input;
             }
-
-            import Write;
 
             fn Main() {
                 Write(1, 2);
@@ -2671,15 +2878,15 @@ mod tests {
     fn transpiles_zero_argument_calls_without_empty_parentheses() {
         let output = transpile(
             r#"
+            import Next;
+            import Touch;
+
             fn Next() -> Integer {
                 return 1;
             }
 
             fn Touch() {
             }
-
-            import Next;
-            import Touch;
 
             fn Main() -> Integer {
                 Touch();

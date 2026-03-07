@@ -616,15 +616,37 @@ impl<'a> Validator<'a> {
     }
 
     fn validate_program(&self, program: &Program) -> Result<(), Diagnostic> {
+        let mut saw_non_context_item = false;
         for item in &program.items {
             match item {
-                Item::Import { name, position } => self.validate_import(name, *position)?,
-                Item::Use { name, position } => self.validate_use(name, *position)?,
+                Item::Import { name, position } => {
+                    if saw_non_context_item {
+                        return Err(Diagnostic::new(
+                            "`import` clauses must appear before top-level declarations",
+                            *position,
+                        ));
+                    }
+                    self.validate_import(name, *position)?;
+                }
+                Item::Use { name, position } => {
+                    if saw_non_context_item {
+                        return Err(Diagnostic::new(
+                            "`use` clauses must appear before top-level declarations",
+                            *position,
+                        ));
+                    }
+                    self.validate_use(name, *position)?;
+                }
                 Item::Subprogram(subprogram) => {
+                    saw_non_context_item = true;
                     self.validate_subprogram(subprogram, None, false, &Scope::default())?
                 }
-                Item::Package(package) => self.validate_package(package)?,
+                Item::Package(package) => {
+                    saw_non_context_item = true;
+                    self.validate_package(package)?
+                }
                 Item::Type(type_decl) => {
+                    saw_non_context_item = true;
                     self.validate_type_decl_visibility(type_decl, None, false)?
                 }
             }
@@ -634,6 +656,17 @@ impl<'a> Validator<'a> {
     }
 
     fn validate_import(&self, name: &Name, position: Position) -> Result<(), Diagnostic> {
+        if let Some(package_name) = self.known_package_member_context_target(name) {
+            return Err(Diagnostic::new(
+                format!(
+                    "`import {}` is not valid because `{}` names a member of package `{package_name}`; import the package instead",
+                    name.as_string(),
+                    name.as_string()
+                ),
+                position,
+            ));
+        }
+
         if name.segments.len() == 1 && self.summary.top_level_types.contains(&name.segments[0]) {
             return Err(Diagnostic::new(
                 format!(
@@ -649,6 +682,17 @@ impl<'a> Validator<'a> {
     }
 
     fn validate_use(&self, name: &Name, position: Position) -> Result<(), Diagnostic> {
+        if let Some(package_name) = self.known_package_member_context_target(name) {
+            return Err(Diagnostic::new(
+                format!(
+                    "`use {}` is not valid because `{}` names a member of package `{package_name}`; use the package instead",
+                    name.as_string(),
+                    name.as_string()
+                ),
+                position,
+            ));
+        }
+
         if name.segments.len() == 1 {
             let identifier = &name.segments[0];
             if self.summary.top_level_declarations.contains_key(identifier)
@@ -678,6 +722,21 @@ impl<'a> Validator<'a> {
         }
 
         Ok(())
+    }
+
+    fn known_package_member_context_target(&self, name: &Name) -> Option<String> {
+        if name.segments.len() <= 1 || self.summary.packages.contains_key(&name.as_string()) {
+            return None;
+        }
+
+        for length in (1..name.segments.len()).rev() {
+            let package_name = name.segments[..length].join(".");
+            if self.summary.packages.contains_key(&package_name) {
+                return Some(package_name);
+            }
+        }
+
+        None
     }
 
     fn validate_package(&self, package: &Package) -> Result<(), Diagnostic> {
