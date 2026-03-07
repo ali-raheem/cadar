@@ -2,5 +2,8 @@
 name = "cadar"
 version = "0.1.0"
 edition = "2024"
-
+authors = ["Ali Raheem"]
+description = "cada is a C-inspired syntax for Ada and Cadar is a transpiler"
+license = "MIT"
+repository = "https://github.com/ali-raheem/cadar"
 [dependencies]
