@@ -710,6 +710,72 @@ fn split_units_adds_with_clause_for_referenced_package_with_import() {
 }
 
 #[test]
+fn split_units_add_with_clause_for_cross_package_type_signatures() {
+    let root = temp_test_dir("split-cross-package-types");
+    let inventory_path = root.join("inventory.cada");
+    let reports_path = root.join("reports.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &inventory_path,
+        r#"
+        package Inventory {
+            type Item = record {
+                Integer Quantity;
+                Integer Price;
+            };
+
+            type Item_Array = [0..1] Item;
+        }
+        "#,
+    )
+    .expect("inventory input should be written");
+    fs::write(
+        &reports_path,
+        r#"
+        import Inventory;
+
+        package Reports {
+            fn First_Quantity(Inventory.Item_Array Items) -> Integer;
+        }
+
+        package body Reports {
+            fn First_Quantity(Inventory.Item_Array Items) -> Integer {
+                return Items[0].Quantity;
+            }
+        }
+        "#,
+    )
+    .expect("reports input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&inventory_path)
+        .arg(&reports_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("reports.ads")).expect("reports spec should exist"),
+        "with Inventory;\n\npackage Reports is\n   function First_Quantity(Items : Inventory.Item_Array) return Integer;\nend Reports;"
+    );
+    assert_eq!(
+        fs::read_to_string(out_dir.join("reports.adb")).expect("reports body should exist"),
+        "with Inventory;\n\npackage body Reports is\n   function First_Quantity(Items : Inventory.Item_Array) return Integer is\n   begin\n      return Items(0).Quantity;\n   end First_Quantity;\nend Reports;"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
 fn maps_transpile_errors_to_the_correct_input_file() {
     let root = temp_test_dir("multi-file-error");
     let helper_path = root.join("helper.cada");

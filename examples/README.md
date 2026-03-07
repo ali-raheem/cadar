@@ -40,5 +40,8 @@ the calling source so visibility matches Ada library-unit behavior.
   aggregates, indexing, and qualified type construction.
 - `18_matrix_trace.cada`: nested array types, matrix-style nested array
   aggregates, chained indexing, and loop-based computation.
+- `19_inventory_report.cada`: a larger package-based flow with shared package
+  types across packages, record arrays, nested aggregates, named arguments,
+  defaults, loops, and cross-package calls.
 
 Expected stdout for each example lives in the matching `.stdout` file.

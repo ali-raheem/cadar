@@ -2393,6 +2393,143 @@ mod tests {
     }
 
     #[test]
+    fn split_unit_files_add_with_clause_for_cross_package_type_signatures() {
+        let files = transpile_project_files(
+            &[
+                SourceInput {
+                    source: r#"
+                    package Inventory {
+                        type Item = record {
+                            Integer Quantity;
+                            Integer Price;
+                        };
+                        type Item_Array = [0..1] Item;
+                    }
+                    "#,
+                },
+                SourceInput {
+                    source: r#"
+                    import Inventory;
+
+                    package Reports {
+                        fn First_Quantity(Inventory.Item_Array Items) -> Integer;
+                    }
+
+                    package body Reports {
+                        fn First_Quantity(Inventory.Item_Array Items) -> Integer {
+                            return Items[0].Quantity;
+                        }
+                    }
+                    "#,
+                },
+            ],
+            "demo",
+        )
+        .expect("split-unit transpile should succeed");
+
+        let files_by_name: HashMap<_, _> = files
+            .into_iter()
+            .map(|file| (file.filename, file.contents))
+            .collect();
+
+        let reports_spec = files_by_name
+            .get("reports.ads")
+            .expect("reports spec should be emitted");
+        assert!(
+            reports_spec.contains("with Inventory;"),
+            "unexpected reports spec: {reports_spec}"
+        );
+        assert!(
+            reports_spec
+                .contains("function First_Quantity(Items : Inventory.Item_Array) return Integer;"),
+            "unexpected reports spec: {reports_spec}"
+        );
+
+        let reports_body = files_by_name
+            .get("reports.adb")
+            .expect("reports body should be emitted");
+        assert!(
+            reports_body.contains("with Inventory;"),
+            "unexpected reports body: {reports_body}"
+        );
+        assert!(
+            reports_body.contains("return Items(0).Quantity;"),
+            "unexpected reports body: {reports_body}"
+        );
+    }
+
+    #[test]
+    fn split_unit_files_scope_same_source_package_imports_per_unit() {
+        let files = transpile_project_files(
+            &[SourceInput {
+                source: r#"
+                import Inventory;
+                import Reports;
+
+                package Inventory {
+                    type Item = record {
+                        Integer Quantity;
+                    };
+                    type Item_Array = [0..0] Item;
+                }
+
+                package Reports {
+                    fn First(Inventory.Item_Array Items) -> Integer;
+                }
+
+                package body Reports {
+                    fn First(Inventory.Item_Array Items) -> Integer {
+                        return Items[0].Quantity;
+                    }
+                }
+
+                fn Main() -> Integer {
+                    Inventory.Item_Array Items = [
+                        Inventory.Item { Quantity = 2 }
+                    ];
+                    return Reports.First(Items);
+                }
+                "#,
+            }],
+            "demo",
+        )
+        .expect("split-unit transpile should succeed");
+
+        let files_by_name: HashMap<_, _> = files
+            .into_iter()
+            .map(|file| (file.filename, file.contents))
+            .collect();
+
+        let inventory_spec = files_by_name
+            .get("inventory.ads")
+            .expect("inventory spec should be emitted");
+        assert!(
+            !inventory_spec.contains("with Reports;"),
+            "unexpected inventory spec: {inventory_spec}"
+        );
+
+        let reports_spec = files_by_name
+            .get("reports.ads")
+            .expect("reports spec should be emitted");
+        assert!(
+            reports_spec.contains("with Inventory;"),
+            "unexpected reports spec: {reports_spec}"
+        );
+
+        let main_body = files_by_name
+            .get("main.adb")
+            .expect("main body should be emitted");
+        assert!(
+            main_body.contains("with Inventory;"),
+            "unexpected main body: {main_body}"
+        );
+        assert!(
+            main_body.contains("with Reports;"),
+            "unexpected main body: {main_body}"
+        );
+    }
+
+    #[test]
     fn aggregate_output_allows_top_level_overloaded_subprograms() {
         let output = transpile(
             r#"

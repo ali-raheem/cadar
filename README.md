@@ -80,7 +80,8 @@ The current compiler is a real end-to-end pipeline:
 - qualified names and a small attribute surface such as `Integer.image(X)`
 - named call arguments and defaulted parameters
 - aggregate output or split-unit Ada file emission
-- GNAT-backed integration tests, including the repository examples
+- GNAT-backed integration tests, including the repository examples and
+  multi-file package graphs
 
 The examples in [`examples/`](examples/) are ordered from minimal to more
 feature-rich and are intended to show the current usable subset.

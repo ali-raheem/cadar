@@ -1465,6 +1465,9 @@ fn render_context_for_unit(
             None => true,
         })
         .filter(|item| !library_units.top_level_subprograms.contains(&item.name))
+        .filter(|item| {
+            !(item.kind == AdaContextKind::With && library_units.packages.contains(&item.name))
+        })
         .cloned()
         .collect();
 

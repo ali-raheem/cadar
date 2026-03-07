@@ -30,6 +30,7 @@ fn gnat_compiles_and_runs_repository_examples() {
         "16_loop_control",
         "17_arrays_of_records",
         "18_matrix_trace",
+        "19_inventory_report",
     ] {
         run_repository_example(stem);
     }
@@ -379,6 +380,119 @@ fn gnat_compiles_multi_file_package_program_with_import() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_multi_file_inventory_reporting_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-inventory-report");
+    let inventory_path = root.join("inventory.cada");
+    let reports_path = root.join("reports.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &inventory_path,
+        r#"
+        package Inventory {
+            type Item = record {
+                Integer Quantity;
+                Integer Price;
+            };
+
+            type Item_Array = [0..2] Item;
+
+            fn Total_Value(Item_Array Items) -> Integer;
+            fn Restock(Item Value, Integer Extra = 1) -> Item;
+        }
+
+        package body Inventory {
+            fn Total_Value(Item_Array Items) -> Integer {
+                Integer Total = 0;
+                for (Integer I in 0..2)
+                    invariant(Total >= 0)
+                {
+                    Total = Total + Items[I].Quantity * Items[I].Price;
+                }
+                return Total;
+            }
+
+            fn Restock(Item Value, Integer Extra = 1) -> Item {
+                return Item {
+                    Quantity = Value.Quantity + Extra,
+                    Price = Value.Price
+                };
+            }
+        }
+        "#,
+    )
+    .expect("inventory input should be written");
+    fs::write(
+        &reports_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Inventory;
+
+        package Reports {
+            fn Print_Total(Inventory.Item_Array Items);
+            fn Count_Low_Stock(Inventory.Item_Array Items, Integer Limit = 3) -> Integer;
+        }
+
+        package body Reports {
+            fn Print_Total(Inventory.Item_Array Items) {
+                Put_Line(Integer.image(Inventory.Total_Value(Items)));
+            }
+
+            fn Count_Low_Stock(Inventory.Item_Array Items, Integer Limit = 3) -> Integer {
+                Integer Count = 0;
+                for (Integer I in 0..2)
+                    invariant(Count >= 0)
+                {
+                    if (Items[I].Quantity < Limit) {
+                        Count = Count + 1;
+                    }
+                }
+                return Count;
+            }
+        }
+        "#,
+    )
+    .expect("reports input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Inventory;
+        import Reports;
+
+        fn Main() {
+            Inventory.Item_Array Items = [
+                Inventory.Item { Quantity = 2, Price = 5 },
+                Inventory.Item { Quantity = 1, Price = 7 },
+                Inventory.Item { Quantity = 4, Price = 3 }
+            ];
+            Inventory.Item Restocked = Inventory.Restock(Items[1], Extra = 4);
+
+            Reports.Print_Total(Items);
+            Put_Line(Integer.image(Reports.Count_Low_Stock(Items)));
+            Put_Line(Integer.image(Restocked.Quantity));
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    run_cadar_split_many(&[&inventory_path, &reports_path, &main_path], &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), " 29\n 2\n 5\n");
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }
