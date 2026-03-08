@@ -177,6 +177,63 @@ fn gnat_build_unit_compiles_non_main_split_program() {
 }
 
 #[test]
+fn gprbuild_build_flag_compiles_split_program_with_project_file() {
+    if !gprbuild_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gprbuild-build-flag");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line("Hello from gprbuild");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--emit-project")
+        .arg("--build")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cadar should run");
+
+    assert!(
+        output.status.success(),
+        "cadar failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        out_dir.join("cadar.gpr").exists(),
+        "project file should be emitted"
+    );
+    assert!(
+        out_dir.join("obj").exists(),
+        "gprbuild should create the configured object directory"
+    );
+
+    let binary_output = run_binary(&out_dir, "main");
+    assert_eq!(
+        String::from_utf8_lossy(&binary_output.stdout),
+        "Hello from gprbuild\n"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
 fn gnat_compiles_boolean_logic_program() {
     if !gnatmake_available() {
         return;
@@ -1090,6 +1147,16 @@ fn run_binary(out_dir: &Path, name: &str) -> process::Output {
 
 fn gnatmake_available() -> bool {
     Command::new("gnatmake")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn gprbuild_available() -> bool {
+    Command::new("gprbuild")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

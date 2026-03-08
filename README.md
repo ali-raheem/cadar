@@ -57,7 +57,9 @@ cadar --write --split-units --build --out-dir build/hello examples/01_hello_worl
 
 If you want a GNAT project file for `gprbuild`, `gnatprove`, or other project
 driven tooling, add `--emit-project`. That writes `cadar.gpr` beside the
-generated Ada units.
+generated Ada units. When `--emit-project` and `--build` are used together,
+`cadar` builds through `gprbuild -P cadar.gpr`; otherwise `--build` uses
+`gnatmake`.
 
 ## What Is Implemented
 

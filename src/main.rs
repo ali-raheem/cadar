@@ -48,7 +48,8 @@ fn run() -> Result<(), String> {
 
         if cli.build {
             let build_unit = resolve_build_unit(&cli).map_err(|error| error.to_string())?;
-            build_outputs(&out_dir, &build_unit).map_err(|error| error.to_string())?;
+            build_outputs(&out_dir, &build_unit, cli.emit_project)
+                .map_err(|error| error.to_string())?;
         }
     } else {
         let outputs = cadar::transpile_project(&sources)
@@ -151,9 +152,9 @@ Reads CADA source from one or more files, or from stdin when no input paths are 
 Options:\n\
   --write           Write .ads/.adb files instead of printing to stdout\n\
   --split-units     Write one Ada file per top-level package/subprogram unit\n\
-  --build           Run `gnatmake -q` on the emitted Ada after writing files\n\
+  --build           Build emitted Ada with `gnatmake`, or `gprbuild` when `--emit-project` is also set\n\
   --emit-project    Write a `cadar.gpr` GNAT project file for split-unit output\n\
-  --build-unit FILE Ada body file to pass to `gnatmake` (default: `main.adb` for split units)\n\
+  --build-unit FILE Ada body file to pass to the build tool (default: `main.adb` for split units)\n\
   --out-dir DIR     Directory for emitted files when using --write\n\
   --basename NAME   File stem to use when writing aggregate files from stdin\n\
   -h, --help        Show this help text\n"
@@ -272,7 +273,11 @@ fn resolve_build_unit(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("{}.adb", resolve_basename(cli)?))
 }
 
-fn build_outputs(out_dir: &Path, build_unit: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn build_outputs(
+    out_dir: &Path,
+    build_unit: &str,
+    use_project_file: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let build_path = out_dir.join(build_unit);
     if !build_path.exists() {
         return Err(format!(
@@ -282,13 +287,53 @@ fn build_outputs(out_dir: &Path, build_unit: &str) -> Result<(), Box<dyn std::er
         .into());
     }
 
-    let mut command = Command::new("gnatmake");
-    command.arg("-q");
-    let output = command.arg(build_unit).current_dir(out_dir).output()?;
+    let (tool, output) = if use_project_file {
+        let project_path = out_dir.join("cadar.gpr");
+        if !project_path.exists() {
+            return Err(format!(
+                "cannot build with `cadar.gpr` because it was not emitted in `{}`",
+                out_dir.display()
+            )
+            .into());
+        }
+
+        let result = Command::new("gprbuild")
+            .arg("-q")
+            .arg("-p")
+            .arg("-P")
+            .arg("cadar.gpr")
+            .arg(build_unit)
+            .current_dir(out_dir)
+            .output();
+        ("gprbuild", result)
+    } else {
+        let result = Command::new("gnatmake")
+            .arg("-q")
+            .arg(build_unit)
+            .current_dir(out_dir)
+            .output();
+        ("gnatmake", result)
+    };
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "`{tool}` was not found in PATH{}",
+                if use_project_file {
+                    "; install `gprbuild` or omit `--emit-project`"
+                } else {
+                    ""
+                }
+            )
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     if !output.status.success() {
         return Err(format!(
-            "gnatmake failed for `{build_unit}`:\nstdout:\n{}\nstderr:\n{}",
+            "{tool} failed for `{build_unit}`:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
