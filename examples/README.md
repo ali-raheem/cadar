@@ -2,7 +2,9 @@
 
 These examples are ordered from minimal to more feature-rich. Each `.cada`
 program defines a `Main` entry point, transpiles with `cadar --write
---split-units`, and is exercised by the GNAT integration tests.
+--split-units`, and is exercised by the GNAT integration tests. Together they
+represent the practical public-alpha subset that `cadar` is expected to handle
+reliably.
 
 For split-unit output, keep overload sets inside packages rather than as
 top-level subprograms, since Ada library-unit filenames must stay unique.

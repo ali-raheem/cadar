@@ -1,9 +1,14 @@
 [package]
 name = "cadar"
-version = "0.1.1"
+version = "0.2.0-alpha.1"
 edition = "2024"
 authors = ["Ali Raheem"]
-description = "cada is a C-inspired syntax for Ada and Cadar is a transpiler"
+description = "C-inspired Ada syntax and a Rust CADA-to-Ada transpiler"
 license = "MIT"
 repository = "https://github.com/ali-raheem/cadar"
+homepage = "https://github.com/ali-raheem/cadar"
+documentation = "https://docs.rs/cadar"
+readme = "README.md"
+keywords = ["ada", "spark", "transpiler", "compiler", "cli"]
+categories = ["command-line-utilities", "compilers"]
 [dependencies]

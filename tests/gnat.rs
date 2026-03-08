@@ -1,9 +1,38 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+const REPOSITORY_EXAMPLES: &[&str] = &[
+    "01_hello_world",
+    "02_control_flow",
+    "03_packages_and_contracts",
+    "04_types_and_ranges",
+    "05_body_only_package",
+    "06_arrays",
+    "07_record_aggregates",
+    "08_named_args_and_defaults",
+    "09_asserts",
+    "10_loop_annotations",
+    "11_dataflow_contracts",
+    "12_package_state",
+    "13_private_package_helpers",
+    "14_nested_block_locals",
+    "15_float_and_character_literals",
+    "16_loop_control",
+    "17_arrays_of_records",
+    "18_matrix_trace",
+    "19_inventory_report",
+    "20_stateful_contracts",
+    "21_alert_pipeline",
+    "22_private_package_sections",
+    "23_import_aliases",
+    "24_exceptions",
+    "25_string_slices",
+];
 
 #[test]
 fn gnat_compiles_and_runs_repository_examples() {
@@ -11,35 +40,44 @@ fn gnat_compiles_and_runs_repository_examples() {
         return;
     }
 
-    for stem in [
-        "01_hello_world",
-        "02_control_flow",
-        "03_packages_and_contracts",
-        "04_types_and_ranges",
-        "05_body_only_package",
-        "06_arrays",
-        "07_record_aggregates",
-        "08_named_args_and_defaults",
-        "09_asserts",
-        "10_loop_annotations",
-        "11_dataflow_contracts",
-        "12_package_state",
-        "13_private_package_helpers",
-        "14_nested_block_locals",
-        "15_float_and_character_literals",
-        "16_loop_control",
-        "17_arrays_of_records",
-        "18_matrix_trace",
-        "19_inventory_report",
-        "20_stateful_contracts",
-        "21_alert_pipeline",
-        "22_private_package_sections",
-        "23_import_aliases",
-        "24_exceptions",
-        "25_string_slices",
-    ] {
+    for stem in REPOSITORY_EXAMPLES {
         run_repository_example(stem);
     }
+}
+
+#[test]
+fn repository_examples_have_stdout_and_are_listed() {
+    let listed = REPOSITORY_EXAMPLES
+        .iter()
+        .map(|stem| (*stem).to_string())
+        .collect::<BTreeSet<_>>();
+    let mut found = BTreeSet::new();
+
+    for entry in fs::read_dir("examples").expect("examples directory should be readable") {
+        let entry = entry.expect("example entry should be readable");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("cada") {
+            continue;
+        }
+
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("example file should have a valid stem")
+            .to_string();
+        let stdout_path = Path::new("examples").join(format!("{stem}.stdout"));
+        assert!(
+            stdout_path.exists(),
+            "missing stdout fixture for example `{stem}` at {}",
+            stdout_path.display()
+        );
+        found.insert(stem);
+    }
+
+    assert_eq!(
+        found, listed,
+        "repository example list and files are out of sync"
+    );
 }
 
 #[test]

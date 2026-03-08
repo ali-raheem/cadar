@@ -160,6 +160,24 @@ fn build_requires_write() {
 }
 
 #[test]
+fn version_flag_prints_package_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--version")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("cadar {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn build_unit_requires_build() {
     let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
         .arg("--build-unit")
@@ -177,6 +195,99 @@ fn build_unit_requires_build() {
         "unexpected stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn build_reports_missing_gnatmake_in_path() {
+    let root = temp_test_dir("missing-gnatmake");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line("Hello");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--build")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .env("PATH", "/nonexistent")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "failed to run `gnatmake -q main.adb`: `gnatmake` was not found in PATH; install GNAT so `gnatmake` is available"
+        ),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn build_reports_missing_gprbuild_in_path() {
+    let root = temp_test_dir("missing-gprbuild");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line("Hello");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--emit-project")
+        .arg("--build")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .env("PATH", "/nonexistent")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "failed to run `gprbuild -q -p -P cadar.gpr main.adb`: `gprbuild` was not found in PATH; install `gprbuild` or omit `--emit-project`"
+        ),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
 }
 
 #[test]

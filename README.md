@@ -6,42 +6,28 @@
 preferences: braces instead of `begin`/`end`, `fn` instead of `function`,
 `->` for return types, and declaration order like `Integer Count = 0;`.
 
-The goal is not to replace Ada semantics or the GNAT/SPARK toolchain. The goal
-is to keep Ada/SPARK's meaning and analyzability while making the source syntax
-feel closer to C, Rust, and other modern languages.
+This public alpha is aimed at a **documented, package-based subset** of
+Ada/SPARK. The goal is not full language coverage. The goal is a reliable path
+for real CADA programs that transpile to normal Ada and build with GNAT.
 
 ## Project Links
 
-- Crate name: `cadar`
-- GitHub: `git@github.com:ali-raheem/cadar.git`
-- Runnable examples: [`examples/`](examples/)
+- Crate: `cadar`
+- Repository: `https://github.com/ali-raheem/cadar`
+- Examples: [`examples/`](examples/)
+
+## Prerequisites
+
+Public alpha is officially supported on **Ubuntu/Linux** with:
+
+- Rust toolchain
+- GNAT (`gnatmake`)
+- `gprbuild`
+
+`gnatprove` is **not** required for this alpha and is not wired into the CLI
+yet.
 
 ## Quick Start
-
-### Build from source
-
-```bash
-git clone git@github.com:ali-raheem/cadar.git
-cd cadar
-cargo build
-```
-
-### Transpile and run an example
-
-This transpiles CADA into split Ada units and builds them with GNAT in one
-command:
-
-```bash
-cargo run -- --write --split-units --build --out-dir build/hello examples/01_hello_world.cada
-cd build/hello
-./main
-```
-
-Expected output:
-
-```text
-Hello from CADA
-```
 
 ### Install from crates.io
 
@@ -49,94 +35,111 @@ Hello from CADA
 cargo install cadar
 ```
 
-Then use it directly:
+### Build from source
+
+```bash
+git clone https://github.com/ali-raheem/cadar.git
+cd cadar
+cargo build
+```
+
+### Transpile and build an example
 
 ```bash
 cadar --write --split-units --build --out-dir build/hello examples/01_hello_world.cada
+cd build/hello
+./main
 ```
 
-If you want a GNAT project file for `gprbuild`, `gnatprove`, or other project
-driven tooling, add `--emit-project`. That writes `cadar.gpr` beside the
-generated Ada units. When `--emit-project` and `--build` are used together,
-`cadar` builds through `gprbuild -P cadar.gpr`; otherwise `--build` uses
+If you want a GNAT project file for project-driven workflows, add
+`--emit-project`. When `--emit-project` and `--build` are used together,
+`cadar` builds with `gprbuild -P cadar.gpr`; otherwise `--build` uses
 `gnatmake`.
 
-## What Is Implemented
+## Public Alpha Contract
 
-The current compiler is a real end-to-end pipeline:
-
-- lexer, parser, AST, semantic validation, Ada lowering, pretty-printing, and CLI
-- one or more `.cada` input files per CLI invocation
-- functions and procedures, including grouped parameter modes
-- imports and `use`, including package aliases with `import ... as ...`
-- local declarations, including nested control-flow block locals, constants,
-  assignments, procedure `return;`, value returns, and call statements
-- control flow: `if`, `while`, `for`, `case`, `null`, `break`, and `continue`
-- exceptions with `raise`, `try`, `catch`, and `catch (others)`
-- body assertions with `assert(...)`
-- loop invariants and loop variants
-- SPARK-style dataflow contracts with `global(...)` and `depends(...)`
-- packages, package bodies, package-level object declarations, body-private
-  helper subprograms, and derived specs for body-only packages
-- contracts with `requires(...)` and `ensures(...)`
-- record types, enum types, and range subtypes
-- record aggregates, constrained arrays, array literals, indexing, slicing, and
-  nested aggregates such as arrays of records and arrays of arrays
-- float and character literals
-- qualified names and array/string attributes such as `.first`, `.last`,
-  `.length`, `.range`, and `Integer.image(X)`
-- named call arguments and defaulted parameters
-- aggregate output or split-unit Ada file emission
-- optional `cadar.gpr` emission for split-unit GNAT project workflows
-- GNAT-backed integration tests, including the repository examples and
-  multi-file package graphs
-
-The examples in [`examples/`](examples/) are ordered from minimal to more
-feature-rich and are intended to show the current usable subset.
-
-## Current Supported Use
-
-Today, the most reliable path is:
+The supported path for this release is:
 
 - package-based CADA programs
 - `--write --split-units` output
-- GNAT compile/run in CI on the generated Ada
+- GNAT compile/run in CI on generated Ada
+- one or more `.cada` input files per invocation
 
-Important current limit:
+If your code stays within the documented subset below, `cadar` should be
+treated as a real alpha tool. If it depends on broader Ada/SPARK coverage, it
+is outside the alpha promise.
+
+## Supported in Public Alpha
+
+- lexer, parser, semantic validation, Ada lowering, pretty-printing, and CLI
+- functions and procedures, including grouped parameter modes
+- imports and `use`, including package aliases with `import ... as ...`
+- local declarations, nested block locals, constants, assignments, and call
+  statements
+- control flow: `if`, `while`, `for`, `case`, `null`, `break`, `continue`, and
+  procedure `return;`
+- exceptions with `raise`, `try`, `catch`, and `catch (others)`
+- assertions, loop invariants, loop variants, and SPARK-style `global(...)` /
+  `depends(...)`
+- packages, package bodies, package state, private package sections, private
+  body helpers, and derived specs for body-only packages
+- contracts with `requires(...)` and `ensures(...)`
+- record types, enum types, range subtypes, arrays, indexing, slicing, nested
+  aggregates, record aggregates, arrays of records, and arrays of arrays
+- float and character literals
+- array and string attributes such as `.first`, `.last`, `.length`, `.range`,
+  and type images like `Integer.image(X)`
+- named call arguments and defaulted parameters
+- aggregate output and split-unit Ada emission
+- optional `cadar.gpr` emission for split-unit project workflows
+
+## Not in Public Alpha
+
+- full Ada or full SPARK coverage
+- top-level overload sets in split-unit output
+- `gnatprove` integration
+- prebuilt release binaries
+- official Windows or macOS support
+- broad advanced Ada features such as generics, tasking, tagged types, and
+  richer exception support
+
+## Known Limits
 
 - split-unit output requires unique top-level Ada library unit names, so
-  top-level overload sets are not supported there yet; put overloads inside a
-  package or use aggregate output instead
-- identifiers that differ only by case are rejected, because Ada treats them as
+  top-level overload sets must stay inside packages or use aggregate output
+- identifiers that differ only by case are rejected because Ada treats them as
   the same name
 - user-defined identifiers must avoid Ada reserved words such as `record`,
   `task`, or `end`
 - external package-qualified references should be explicit: add `import P;` or
   `use P;` before referring to `P.X`
 - external top-level subprogram calls should also be explicit: add
-  `import Name;` before calling another library-unit subprogram like `Name(...)`
+  `import Name;` before calling another library-unit subprogram
 - `use` is for packages in the supported CADA surface; do not write `use Name;`
   for top-level subprograms or top-level types
-- `import` / `use` should name library units or packages, not package members
-  like `Math.Add` or `State.Count`
-- `import` / `use` clauses should stay at the top of a source file, before any
-  top-level declarations
+- `import` / `use` should name packages or library units, not package members
+- `import` / `use` clauses should stay at the top of a source file
 
-## What Is Left To Do
+## Examples
 
-Important remaining work includes:
+The repository includes 25 runnable examples in [`examples/`](examples/), from
+minimal `Text_IO` programs through multi-package flows with contracts, package
+state, nested aggregates, and CLI/text handling. These are part of the GNAT
+integration suite and are the best reference for the supported subset.
 
-- richer name resolution and more precise type checking
-- more complete expression and type coverage
-- more SPARK-oriented features such as `Refined_Post`
-- more Ada coverage: private/tagged types, generics, richer exception support,
-  and tasking
-- tighter source mapping, better diagnostics, and more output/toolchain polish
-- optional `gnatprove` integration
+## Reporting Issues
 
-## Current Status
+When filing bugs, include:
 
-`cadar` transpiles CADA source into normal Ada, supports split-unit output, and
-includes GNAT-backed compile-and-run integration tests. The current repository
-already contains runnable examples that demonstrate the implemented language
-surface and serve as regression coverage for the generated Ada.
+- the CADA source
+- generated Ada if relevant
+- `cadar --version`
+- `gnatmake --version`
+- `gprbuild --version`
+- the exact command used
+
+## Status
+
+`cadar` is now a **source-first public alpha**: usable for real package-based
+programs on the documented subset, with GNAT-backed integration coverage and a
+clear boundary around unsupported features.

@@ -20,6 +20,10 @@ fn run() -> Result<(), String> {
         print!("{}", usage());
         return Ok(());
     }
+    if cli.show_version {
+        println!("{}", version());
+        return Ok(());
+    }
 
     let bundle = read_source_bundle(&cli)?;
     let sources = bundle
@@ -71,6 +75,7 @@ struct Cli {
     out_dir: Option<PathBuf>,
     basename: Option<String>,
     show_help: bool,
+    show_version: bool,
 }
 
 impl Cli {
@@ -81,6 +86,7 @@ impl Cli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => cli.show_help = true,
+                "-V" | "--version" => cli.show_version = true,
                 "--write" => cli.write_files = true,
                 "--split-units" => cli.split_units = true,
                 "--build" => cli.build = true,
@@ -118,7 +124,7 @@ impl Cli {
             }
         }
 
-        if cli.show_help {
+        if cli.show_help || cli.show_version {
             return Ok(cli);
         }
 
@@ -157,7 +163,12 @@ Options:\n\
   --build-unit FILE Ada body file to pass to the build tool (default: `main.adb` for split units)\n\
   --out-dir DIR     Directory for emitted files when using --write\n\
   --basename NAME   File stem to use when writing aggregate files from stdin\n\
+  -V, --version     Show the cadar version\n\
   -h, --help        Show this help text\n"
+}
+
+fn version() -> String {
+    format!("cadar {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn write_outputs(
@@ -287,7 +298,7 @@ fn build_outputs(
         .into());
     }
 
-    let (tool, output) = if use_project_file {
+    let (tool, command_display, output) = if use_project_file {
         let project_path = out_dir.join("cadar.gpr");
         if !project_path.exists() {
             return Err(format!(
@@ -305,25 +316,29 @@ fn build_outputs(
             .arg(build_unit)
             .current_dir(out_dir)
             .output();
-        ("gprbuild", result)
+        (
+            "gprbuild",
+            format!("gprbuild -q -p -P cadar.gpr {build_unit}"),
+            result,
+        )
     } else {
         let result = Command::new("gnatmake")
             .arg("-q")
             .arg(build_unit)
             .current_dir(out_dir)
             .output();
-        ("gnatmake", result)
+        ("gnatmake", format!("gnatmake -q {build_unit}"), result)
     };
 
     let output = match output {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "`{tool}` was not found in PATH{}",
+                "failed to run `{command_display}`: `{tool}` was not found in PATH{}",
                 if use_project_file {
                     "; install `gprbuild` or omit `--emit-project`"
                 } else {
-                    ""
+                    "; install GNAT so `gnatmake` is available"
                 }
             )
             .into());
@@ -333,7 +348,8 @@ fn build_outputs(
 
     if !output.status.success() {
         return Err(format!(
-            "{tool} failed for `{build_unit}`:\nstdout:\n{}\nstderr:\n{}",
+            "`{command_display}` failed in `{}` for `{build_unit}`:\nstdout:\n{}\nstderr:\n{}",
+            out_dir.display(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
