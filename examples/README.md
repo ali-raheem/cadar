@@ -46,5 +46,11 @@ the calling source so visibility matches Ada library-unit behavior.
 - `20_stateful_contracts.cada`: package state plus contracts shared across
   packages, including record types, pre/postconditions, dataflow aspects, and
   reporting over public package state.
+- `21_alert_pipeline.cada`: a deeper package graph with shared record arrays,
+  package state accumulation, cross-package reporting, contracts, and a final
+  multi-package check in `Main`.
+- `22_private_package_sections.cada`: package specs with a `private { ... }`
+  section, including hidden types, hidden state, and private helper
+  declarations consumed by the package body.
 
 Expected stdout for each example lives in the matching `.stdout` file.

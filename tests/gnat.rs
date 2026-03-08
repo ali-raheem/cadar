@@ -32,6 +32,8 @@ fn gnat_compiles_and_runs_repository_examples() {
         "18_matrix_trace",
         "19_inventory_report",
         "20_stateful_contracts",
+        "21_alert_pipeline",
+        "22_private_package_sections",
     ] {
         run_repository_example(stem);
     }
@@ -65,6 +67,111 @@ fn gnat_compiles_and_runs_split_hello_world() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "Hello\n");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_build_flag_compiles_split_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-build-flag");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Main() {
+            Put_Line("Hello");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--build")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cadar should run");
+
+    assert!(
+        output.status.success(),
+        "cadar failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("built"),
+        "unexpected stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let binary_output = run_binary(&out_dir, "main");
+    assert_eq!(String::from_utf8_lossy(&binary_output.stdout), "Hello\n");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_build_unit_compiles_non_main_split_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-build-unit");
+    let input_path = root.join("tool.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+
+        fn Tool() {
+            Put_Line("Built via --build-unit");
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--build")
+        .arg("--build-unit")
+        .arg("tool.adb")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cadar should run");
+
+    assert!(
+        output.status.success(),
+        "cadar failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("built"),
+        "unexpected stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let binary_output = run_binary(&out_dir, "tool");
+    assert_eq!(
+        String::from_utf8_lossy(&binary_output.stdout),
+        "Built via --build-unit\n"
+    );
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }
@@ -608,6 +715,138 @@ fn gnat_compiles_multi_file_stateful_contract_program() {
         String::from_utf8_lossy(&output.stdout),
         " 5\n 1\n 2\nstable\n"
     );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_multi_file_alert_pipeline_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-alert-pipeline");
+    let telemetry_path = root.join("telemetry.cada");
+    let dashboard_path = root.join("dashboard.cada");
+    let reports_path = root.join("reports.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &telemetry_path,
+        r#"
+        package Telemetry {
+            type Sample = record {
+                Integer Level;
+                Integer Limit;
+            };
+
+            type Sample_Array = [0..2] Sample;
+
+            fn Count_Alerts(Sample_Array Data) -> Integer
+                ensures(result >= 0);
+        }
+
+        package body Telemetry {
+            fn Count_Alerts(Sample_Array Data) -> Integer
+                ensures(result >= 0) {
+                Integer Count = 0;
+                for (Integer I in 0..2)
+                    invariant(Count >= 0)
+                {
+                    if (Data[I].Level > Data[I].Limit) {
+                        Count = Count + 1;
+                    }
+                }
+                return Count;
+            }
+        }
+        "#,
+    )
+    .expect("telemetry input should be written");
+    fs::write(
+        &dashboard_path,
+        r#"
+        import Telemetry;
+
+        package Dashboard {
+            Integer Total_Alerts = 0;
+
+            fn Capture(Telemetry.Sample_Array Data)
+                global(in_out => Total_Alerts)
+                depends(Total_Alerts => [Total_Alerts, Data]);
+        }
+
+        package body Dashboard {
+            fn Capture(Telemetry.Sample_Array Data) {
+                Total_Alerts = Total_Alerts + Telemetry.Count_Alerts(Data);
+            }
+        }
+        "#,
+    )
+    .expect("dashboard input should be written");
+    fs::write(
+        &reports_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Dashboard;
+        import Telemetry;
+
+        package Reports {
+            fn Show(Telemetry.Sample_Array Data);
+        }
+
+        package body Reports {
+            fn Show(Telemetry.Sample_Array Data) {
+                Put_Line(Integer.image(Telemetry.Count_Alerts(Data)));
+                Put_Line(Integer.image(Dashboard.Total_Alerts));
+            }
+        }
+        "#,
+    )
+    .expect("reports input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Dashboard;
+        import Reports;
+        import Telemetry;
+
+        fn Main() {
+            Telemetry.Sample_Array First = [
+                Telemetry.Sample { Level = 2, Limit = 3 },
+                Telemetry.Sample { Level = 5, Limit = 3 },
+                Telemetry.Sample { Level = 1, Limit = 1 }
+            ];
+            Telemetry.Sample_Array Second = [
+                Telemetry.Sample { Level = 7, Limit = 3 },
+                Telemetry.Sample { Level = 4, Limit = 4 },
+                Telemetry.Sample { Level = 2, Limit = 1 }
+            ];
+
+            Dashboard.Capture(First);
+            Dashboard.Capture(Second);
+            Reports.Show(Second);
+
+            if ((Dashboard.Total_Alerts == 3) && (Telemetry.Count_Alerts(Second) == 2)) {
+                Put_Line("ok");
+            }
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    run_cadar_split_many(
+        &[&telemetry_path, &dashboard_path, &reports_path, &main_path],
+        &out_dir,
+    );
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), " 2\n 3\nok\n");
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }

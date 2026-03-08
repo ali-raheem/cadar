@@ -141,6 +141,177 @@ fn requires_basename_when_writing_from_stdin() {
 }
 
 #[test]
+fn build_requires_write() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--build")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("`--build` requires `--write`"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn build_unit_requires_build() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--build-unit")
+        .arg("main.adb")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("`--build-unit` requires `--build`"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn emit_project_requires_write() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--emit-project")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("`--emit-project` requires `--write`"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn emit_project_requires_split_units() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--emit-project")
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("`--emit-project` requires `--split-units`"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn build_reports_missing_default_main_unit() {
+    let root = temp_test_dir("build-missing-main");
+    let input_path = root.join("helper.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        fn Helper() {
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--build")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cannot build `main.adb` because it was not emitted"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_emit_project_file() {
+    let root = temp_test_dir("emit-project");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        fn Main() {
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg("--emit-project")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        output.status.success(),
+        "cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let project = fs::read_to_string(out_dir.join("cadar.gpr")).expect("project file should exist");
+    assert!(
+        project.contains("project Cadar is"),
+        "unexpected project file: {project}"
+    );
+    assert!(
+        project.contains("for Source_Dirs use (\".\");"),
+        "unexpected project file: {project}"
+    );
+    assert!(
+        project.contains("for Object_Dir use \"obj\";"),
+        "unexpected project file: {project}"
+    );
+    assert!(
+        project.contains("for Exec_Dir use \".\";"),
+        "unexpected project file: {project}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
 fn prints_source_snippet_for_transpile_errors() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cadar"))
         .stdin(Stdio::piped())
@@ -449,6 +620,50 @@ fn split_units_rejects_late_import_clause() {
     );
     assert!(
         stderr.contains(&format!("--> {}:6:", input_path.display())),
+        "unexpected stderr: {stderr}"
+    );
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn split_units_rejects_ada_reserved_word_identifier() {
+    let root = temp_test_dir("split-reserved-word");
+    let input_path = root.join("bundle.cada");
+
+    fs::write(
+        &input_path,
+        r#"
+        fn Record() {
+            null;
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cadar"))
+        .arg("--write")
+        .arg("--split-units")
+        .arg(&input_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(
+        !output.status.success(),
+        "cli unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "top-level subprogram `Record` uses Ada reserved word `record` and cannot be used as an identifier"
+        ) || stderr.contains(
+            "subprogram `Record` uses Ada reserved word `record` and cannot be used as an identifier"
+        ),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("--> {}:2:", input_path.display())),
         "unexpected stderr: {stderr}"
     );
 

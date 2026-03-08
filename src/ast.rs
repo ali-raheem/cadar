@@ -30,6 +30,7 @@ pub struct Package {
     pub is_body: bool,
     pub name: Name,
     pub items: Vec<PackageItem>,
+    pub private_items: Vec<PackageItem>,
     pub position: Position,
 }
 

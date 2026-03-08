@@ -140,7 +140,8 @@ pub struct AdaSubprogramBody {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdaPackageSpec {
     pub name: Name,
-    pub items: Vec<AdaPackageSpecItem>,
+    pub visible_items: Vec<AdaPackageSpecItem>,
+    pub private_items: Vec<AdaPackageSpecItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,7 +523,8 @@ fn lower_package(
         Ok(LoweredPackage::Body {
             derived_spec: AdaPackageSpec {
                 name: package.name.clone(),
-                items: spec_items,
+                visible_items: spec_items,
+                private_items: Vec::new(),
             },
             body: AdaPackageBody {
                 name: package.name,
@@ -530,7 +532,7 @@ fn lower_package(
             },
         })
     } else {
-        let mut items = Vec::new();
+        let mut visible_items = Vec::new();
         for item in package.items {
             match item {
                 PackageItem::Subprogram(subprogram) => {
@@ -540,24 +542,50 @@ fn lower_package(
                             subprogram.position,
                         ));
                     }
-                    items.push(AdaPackageSpecItem::Subprogram(lower_spec(
+                    visible_items.push(AdaPackageSpecItem::Subprogram(lower_spec(
                         &subprogram,
                         lowering,
                     )?));
                 }
                 PackageItem::Type(type_decl) => {
-                    items.push(AdaPackageSpecItem::Type(lower_type_decl(
+                    visible_items.push(AdaPackageSpecItem::Type(lower_type_decl(
                         type_decl, lowering,
                     )));
                 }
                 PackageItem::Object(decl) => {
-                    items.push(AdaPackageSpecItem::Object(lower_decl(decl, lowering)?));
+                    visible_items.push(AdaPackageSpecItem::Object(lower_decl(decl, lowering)?));
+                }
+            }
+        }
+        let mut private_items = Vec::new();
+        for item in package.private_items {
+            match item {
+                PackageItem::Subprogram(subprogram) => {
+                    if subprogram.body.is_some() {
+                        return Err(Diagnostic::new(
+                            "private package sections cannot contain subprogram bodies",
+                            subprogram.position,
+                        ));
+                    }
+                    private_items.push(AdaPackageSpecItem::Subprogram(lower_spec(
+                        &subprogram,
+                        lowering,
+                    )?));
+                }
+                PackageItem::Type(type_decl) => {
+                    private_items.push(AdaPackageSpecItem::Type(lower_type_decl(
+                        type_decl, lowering,
+                    )));
+                }
+                PackageItem::Object(decl) => {
+                    private_items.push(AdaPackageSpecItem::Object(lower_decl(decl, lowering)?));
                 }
             }
         }
         Ok(LoweredPackage::Spec(AdaPackageSpec {
             name: package.name,
-            items,
+            visible_items,
+            private_items,
         }))
     }
 }
@@ -1552,7 +1580,7 @@ fn render_context_item(item: &AdaContextItem) -> String {
 fn render_package_spec(package: &AdaPackageSpec) -> Vec<String> {
     let mut lines = vec![format!("package {} is", package.name.as_string())];
 
-    for item in &package.items {
+    for item in &package.visible_items {
         match item {
             AdaPackageSpecItem::Subprogram(spec) => {
                 lines.extend(render_subprogram_spec_lines(spec, 1));
@@ -1560,6 +1588,21 @@ fn render_package_spec(package: &AdaPackageSpec) -> Vec<String> {
             AdaPackageSpecItem::Type(type_decl) => lines.extend(render_type_decl(type_decl, 1)),
             AdaPackageSpecItem::Object(decl) => {
                 lines.push(format!("{}{}", indent(1), render_object_decl(decl)));
+            }
+        }
+    }
+
+    if !package.private_items.is_empty() {
+        lines.push(format!("{}private", indent(1)));
+        for item in &package.private_items {
+            match item {
+                AdaPackageSpecItem::Subprogram(spec) => {
+                    lines.extend(render_subprogram_spec_lines(spec, 1));
+                }
+                AdaPackageSpecItem::Type(type_decl) => lines.extend(render_type_decl(type_decl, 1)),
+                AdaPackageSpecItem::Object(decl) => {
+                    lines.push(format!("{}{}", indent(1), render_object_decl(decl)));
+                }
             }
         }
     }
@@ -1629,8 +1672,9 @@ fn collect_private_package_body_specs<'a>(
 ) -> Vec<&'a AdaSubprogramSpec> {
     let visible_subprograms = visible_spec
         .map(|spec| {
-            spec.items
+            spec.visible_items
                 .iter()
+                .chain(spec.private_items.iter())
                 .filter_map(|item| match item {
                     AdaPackageSpecItem::Subprogram(spec) => Some(subprogram_identity(spec)),
                     AdaPackageSpecItem::Type(_) | AdaPackageSpecItem::Object(_) => None,
@@ -2508,7 +2552,11 @@ fn collect_package_spec_dependencies(
     library_units: &LibraryUnits,
 ) -> Vec<Name> {
     let mut dependencies = HashSet::new();
-    for item in &package.items {
+    for item in package
+        .visible_items
+        .iter()
+        .chain(package.private_items.iter())
+    {
         match item {
             AdaPackageSpecItem::Subprogram(spec) => {
                 collect_subprogram_spec_dependency_set(spec, library_units, &mut dependencies);

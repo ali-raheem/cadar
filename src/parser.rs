@@ -68,9 +68,27 @@ impl<'a> Parser<'a> {
         self.expect_simple(TokenKind::LBrace, "expected `{` after package name")?;
 
         let mut items = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Private) {
             items.push(self.parse_package_item()?);
         }
+
+        let private_items = if self.matches_simple(&TokenKind::Private) {
+            if is_body {
+                return Err(self.error_here("package bodies cannot contain `private` sections"));
+            }
+            self.expect_simple(TokenKind::LBrace, "expected `{` after `private`")?;
+            let mut private_items = Vec::new();
+            while !self.check(&TokenKind::RBrace) {
+                private_items.push(self.parse_package_item()?);
+            }
+            self.expect_simple(
+                TokenKind::RBrace,
+                "expected `}` after private package items",
+            )?;
+            private_items
+        } else {
+            Vec::new()
+        };
 
         self.expect_simple(TokenKind::RBrace, "expected `}` after package body")?;
 
@@ -78,6 +96,7 @@ impl<'a> Parser<'a> {
             is_body,
             name,
             items,
+            private_items,
             position,
         })
     }

@@ -261,6 +261,50 @@ mod tests {
     }
 
     #[test]
+    fn transpiles_private_package_sections() {
+        let output = transpile(
+            r#"
+            package Metrics {
+                fn Read() -> Integer;
+
+                private {
+                    Integer Hidden_Total = 2;
+
+                    type Hidden = record {
+                        Integer Value;
+                    };
+
+                    fn Boost(Hidden Data) -> Integer;
+                }
+            }
+
+            package body Metrics {
+                fn Read() -> Integer {
+                    Hidden Data;
+                    Data.Value = Hidden_Total;
+                    return Boost(Data);
+                }
+
+                fn Boost(Hidden Data) -> Integer {
+                    Hidden_Total = Hidden_Total + 1;
+                    return Data.Value + Hidden_Total;
+                }
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(
+            output.spec,
+            "package Metrics is\n   function Read return Integer;\n   private\n   Hidden_Total : Integer := 2;\n   type Hidden is record\n      Value : Integer;\n   end record;\n   function Boost(Data : Hidden) return Integer;\nend Metrics;"
+        );
+        assert_eq!(
+            output.body,
+            "package body Metrics is\n   function Read return Integer is\n      Data : Hidden;\n   begin\n      Data.Value := Hidden_Total;\n      return Boost(Data);\n   end Read;\n\n   function Boost(Data : Hidden) return Integer is\n   begin\n      Hidden_Total := Hidden_Total + 1;\n      return Data.Value + Hidden_Total;\n   end Boost;\nend Metrics;"
+        );
+    }
+
+    #[test]
     fn rejects_package_spec_with_subprogram_body() {
         let error = transpile(
             r#"
@@ -277,6 +321,63 @@ mod tests {
             error
                 .message
                 .contains("package specifications cannot contain subprogram bodies"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_public_package_signature_using_private_spec_type() {
+        let error = transpile(
+            r#"
+            package Metrics {
+                fn Read(Hidden Data) -> Integer;
+
+                private {
+                    type Hidden = record {
+                        Integer Value;
+                    };
+                }
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("type `Hidden` is not visible in parameter type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_external_use_of_private_spec_type() {
+        let error = transpile(
+            r#"
+            import Metrics;
+
+            package Metrics {
+                private {
+                    type Hidden = record {
+                        Integer Value;
+                    };
+                }
+            }
+
+            fn Main() {
+                Metrics.Hidden Value;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("type `Metrics.Hidden` is not visible in local initializer")
+                || error
+                    .message
+                    .contains("type `Metrics.Hidden` is not visible in object type"),
             "unexpected error: {error}"
         );
     }
@@ -761,6 +862,84 @@ mod tests {
                 "top-level subprogram `parse` differs only by case from `Parse`; Ada identifiers are case-insensitive"
             ) || error.message.contains(
                 "subprogram `parse` differs only by case from `Parse`; Ada identifiers are case-insensitive"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ada_reserved_word_subprogram_name() {
+        let error = transpile(
+            r#"
+            fn Record() {
+                null;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "top-level subprogram `Record` uses Ada reserved word `record` and cannot be used as an identifier"
+            ) || error.message.contains(
+                "subprogram `Record` uses Ada reserved word `record` and cannot be used as an identifier"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ada_reserved_word_parameter_name() {
+        let error = transpile(
+            r#"
+            fn Add(Integer end) -> Integer {
+                return end;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "parameter `end` uses Ada reserved word `end` and cannot be used as an identifier"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ada_reserved_word_record_field_name() {
+        let error = transpile(
+            r#"
+            type Point = record {
+                Integer Record;
+            };
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "field of record `Point` `Record` uses Ada reserved word `record` and cannot be used as an identifier"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ada_reserved_word_package_object_name() {
+        let error = transpile(
+            r#"
+            package State {
+                Integer task = 0;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "object in package `State` `task` uses Ada reserved word `task` and cannot be used as an identifier"
             ),
             "unexpected error: {error}"
         );

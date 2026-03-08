@@ -199,14 +199,15 @@ impl SubprogramSignature {
 struct PackageSummary {
     has_spec: bool,
     has_body: bool,
-    spec_subprograms: SignatureIndex,
+    visible_spec_subprograms: SignatureIndex,
+    all_spec_subprograms: SignatureIndex,
     body_subprograms: SignatureIndex,
 }
 
 impl PackageSummary {
     fn visible_subprograms(&self) -> &SignatureIndex {
         if self.has_spec {
-            &self.spec_subprograms
+            &self.visible_spec_subprograms
         } else {
             &self.body_subprograms
         }
@@ -267,13 +268,17 @@ struct ProgramSummary {
     top_level_enum_literal_types: HashMap<String, Vec<String>>,
     packages: HashMap<String, PackageSummary>,
     package_spec_types: HashMap<String, HashSet<String>>,
+    package_private_spec_types: HashMap<String, HashSet<String>>,
     package_body_types: HashMap<String, HashSet<String>>,
     package_types: HashMap<String, HashSet<String>>,
     package_spec_values: HashMap<String, HashMap<String, ValueInfo>>,
+    package_private_spec_values: HashMap<String, HashMap<String, ValueInfo>>,
     package_body_values: HashMap<String, HashMap<String, ValueInfo>>,
     package_enum_literals: HashMap<String, HashSet<String>>,
+    package_public_enum_literals: HashMap<String, HashSet<String>>,
     package_type_kinds: HashMap<String, HashMap<String, TypeKind>>,
     package_enum_literal_types: HashMap<String, HashMap<String, Vec<String>>>,
+    package_public_enum_literal_types: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 impl ProgramSummary {
@@ -353,12 +358,20 @@ impl ProgramSummary {
                             .package_spec_types
                             .entry(package_name.clone())
                             .or_default();
+                        let package_private_spec_types = summary
+                            .package_private_spec_types
+                            .entry(package_name.clone())
+                            .or_default();
                         let package_body_types = summary
                             .package_body_types
                             .entry(package_name.clone())
                             .or_default();
                         let package_spec_values = summary
                             .package_spec_values
+                            .entry(package_name.clone())
+                            .or_default();
+                        let package_private_spec_values = summary
+                            .package_private_spec_values
                             .entry(package_name.clone())
                             .or_default();
                         let package_body_values = summary
@@ -369,12 +382,20 @@ impl ProgramSummary {
                             .package_enum_literals
                             .entry(package_name.clone())
                             .or_default();
+                        let package_public_enum_literals = summary
+                            .package_public_enum_literals
+                            .entry(package_name.clone())
+                            .or_default();
                         let package_type_kinds = summary
                             .package_type_kinds
                             .entry(package_name.clone())
                             .or_default();
                         let package_enum_literal_types = summary
                             .package_enum_literal_types
+                            .entry(package_name.clone())
+                            .or_default();
+                        let package_public_enum_literal_types = summary
+                            .package_public_enum_literal_types
                             .entry(package_name.clone())
                             .or_default();
                         let package_subprogram_spellings = package_subprogram_spellings
@@ -399,7 +420,9 @@ impl ProgramSummary {
                             }
                             entry.has_body = true;
                             collect_package_items(
-                                package,
+                                &package_name,
+                                &package.items,
+                                &format!("package body `{package_name}`"),
                                 source_index,
                                 PackageCollections {
                                     signatures: &mut entry.body_subprograms,
@@ -429,16 +452,43 @@ impl ProgramSummary {
                             }
                             entry.has_spec = true;
                             collect_package_items(
-                                package,
+                                &package_name,
+                                &package.items,
+                                &format!("package `{package_name}`"),
                                 source_index,
                                 PackageCollections {
-                                    signatures: &mut entry.spec_subprograms,
+                                    signatures: &mut entry.visible_spec_subprograms,
                                     subprogram_spellings: package_subprogram_spellings,
                                     values: package_spec_values,
                                     value_spellings: package_value_spellings,
                                     type_names: package_types,
                                     type_spellings: package_type_spellings,
                                     section_type_names: package_spec_types,
+                                    enum_literals: package_public_enum_literals,
+                                    type_kinds: package_type_kinds,
+                                    enum_literal_types: package_public_enum_literal_types,
+                                },
+                            )
+                            .map_err(|diagnostic| {
+                                IndexedDiagnostic::new(source_index, diagnostic)
+                            })?;
+                            entry.all_spec_subprograms = entry.visible_spec_subprograms.clone();
+                            package_enum_literals.extend(package_public_enum_literals.clone());
+                            package_enum_literal_types
+                                .extend(package_public_enum_literal_types.clone());
+                            collect_package_items(
+                                &package_name,
+                                &package.private_items,
+                                &format!("private section of package `{package_name}`"),
+                                source_index,
+                                PackageCollections {
+                                    signatures: &mut entry.all_spec_subprograms,
+                                    subprogram_spellings: package_subprogram_spellings,
+                                    values: package_private_spec_values,
+                                    value_spellings: package_value_spellings,
+                                    type_names: package_types,
+                                    type_spellings: package_type_spellings,
+                                    section_type_names: package_private_spec_types,
                                     enum_literals: package_enum_literals,
                                     type_kinds: package_type_kinds,
                                     enum_literal_types: package_enum_literal_types,
@@ -464,7 +514,7 @@ impl ProgramSummary {
 
             for body_signature in iter_signatures(&package.body_subprograms) {
                 if let Some(spec_signature) =
-                    find_signature(&package.spec_subprograms, &body_signature.key)
+                    find_signature(&package.all_spec_subprograms, &body_signature.key)
                 {
                     validate_definition_matches_declaration(spec_signature, body_signature)
                         .map_err(|diagnostic| {
@@ -473,7 +523,7 @@ impl ProgramSummary {
                 }
             }
 
-            for spec_signature in iter_signatures(&package.spec_subprograms) {
+            for spec_signature in iter_signatures(&package.all_spec_subprograms) {
                 if !contains_signature(&package.body_subprograms, &spec_signature.key) {
                     return Err(IndexedDiagnostic::new(
                         spec_signature.source_index,
@@ -639,7 +689,7 @@ impl<'a> Validator<'a> {
                 }
                 Item::Subprogram(subprogram) => {
                     saw_non_context_item = true;
-                    self.validate_subprogram(subprogram, None, false, &Scope::default())?
+                    self.validate_subprogram(subprogram, None, false, false, &Scope::default())?
                 }
                 Item::Package(package) => {
                     saw_non_context_item = true;
@@ -647,7 +697,7 @@ impl<'a> Validator<'a> {
                 }
                 Item::Type(type_decl) => {
                     saw_non_context_item = true;
-                    self.validate_type_decl_visibility(type_decl, None, false)?
+                    self.validate_type_decl_visibility(type_decl, None, false, false)?
                 }
             }
         }
@@ -741,7 +791,7 @@ impl<'a> Validator<'a> {
 
     fn validate_package(&self, package: &Package) -> Result<(), Diagnostic> {
         let package_name = package.name.as_string();
-        let mut scope = self.package_scope(&package_name, package.is_body);
+        let mut scope = self.package_scope(&package_name, package.is_body, package.is_body);
         if package.is_body
             && let Some(package_summary) = self.summary.packages.get(&package_name)
         {
@@ -751,20 +801,31 @@ impl<'a> Validator<'a> {
         for item in &package.items {
             match item {
                 PackageItem::Object(decl) => {
-                    self.validate_object_decl(decl, &scope, Some(&package_name), package.is_body)?;
+                    self.validate_object_decl(
+                        decl,
+                        &scope,
+                        Some(&package_name),
+                        false,
+                        package.is_body,
+                    )?;
                 }
                 PackageItem::Subprogram(subprogram) => {
-                    let allow_body_types_in_signature = if package.is_body {
-                        self.package_body_subprogram_uses_private_signature_types(
-                            &package_name,
-                            subprogram,
-                        )
-                    } else {
-                        false
-                    };
+                    let (allow_private_spec_types_in_signature, allow_body_types_in_signature) =
+                        if package.is_body {
+                            (
+                                true,
+                                self.package_body_subprogram_uses_private_signature_types(
+                                    &package_name,
+                                    subprogram,
+                                ),
+                            )
+                        } else {
+                            (false, false)
+                        };
                     self.validate_subprogram(
                         subprogram,
                         Some(&package_name),
+                        allow_private_spec_types_in_signature,
                         allow_body_types_in_signature,
                         &scope,
                     )?;
@@ -773,8 +834,43 @@ impl<'a> Validator<'a> {
                     self.validate_type_decl_visibility(
                         type_decl,
                         Some(&package_name),
+                        false,
                         package.is_body,
                     )?;
+                }
+            }
+        }
+
+        if !package.is_body {
+            let private_scope = self.package_scope(&package_name, true, false);
+            for item in &package.private_items {
+                match item {
+                    PackageItem::Object(decl) => {
+                        self.validate_object_decl(
+                            decl,
+                            &private_scope,
+                            Some(&package_name),
+                            true,
+                            false,
+                        )?;
+                    }
+                    PackageItem::Subprogram(subprogram) => {
+                        self.validate_subprogram(
+                            subprogram,
+                            Some(&package_name),
+                            true,
+                            false,
+                            &private_scope,
+                        )?;
+                    }
+                    PackageItem::Type(type_decl) => {
+                        self.validate_type_decl_visibility(
+                            type_decl,
+                            Some(&package_name),
+                            true,
+                            false,
+                        )?;
+                    }
                 }
             }
         }
@@ -786,6 +882,7 @@ impl<'a> Validator<'a> {
         &self,
         subprogram: &Subprogram,
         current_package: Option<&str>,
+        allow_private_spec_types_in_signature: bool,
         allow_package_body_types_in_signature: bool,
         initial_scope: &Scope,
     ) -> Result<(), Diagnostic> {
@@ -796,6 +893,7 @@ impl<'a> Validator<'a> {
             self.validate_type_reference_visible(
                 &param.ty,
                 current_package,
+                allow_private_spec_types_in_signature,
                 allow_package_body_types_in_signature,
                 "parameter type",
                 subprogram.position,
@@ -844,6 +942,7 @@ impl<'a> Validator<'a> {
             self.validate_type_reference_visible(
                 return_type,
                 current_package,
+                allow_private_spec_types_in_signature,
                 allow_package_body_types_in_signature,
                 "subprogram return type",
                 subprogram.position,
@@ -891,6 +990,7 @@ impl<'a> Validator<'a> {
                         decl,
                         &scope,
                         current_package,
+                        allow_private_spec_types_in_signature || current_package.is_some(),
                         current_package.is_some(),
                     )?;
                     register_case_distinct_spelling(
@@ -1063,11 +1163,13 @@ impl<'a> Validator<'a> {
         decl: &LocalDecl,
         scope: &Scope,
         current_package: Option<&str>,
+        allow_private_spec_types: bool,
         allow_package_body_types: bool,
     ) -> Result<(), Diagnostic> {
         self.validate_type_reference_visible(
             &decl.ty,
             current_package,
+            allow_private_spec_types,
             allow_package_body_types,
             "object type",
             decl.position,
@@ -1096,6 +1198,7 @@ impl<'a> Validator<'a> {
         &self,
         type_decl: &TypeDecl,
         current_package: Option<&str>,
+        allow_private_spec_types: bool,
         allow_package_body_types: bool,
     ) -> Result<(), Diagnostic> {
         match type_decl {
@@ -1104,6 +1207,7 @@ impl<'a> Validator<'a> {
                     self.validate_type_reference_visible(
                         &field.ty,
                         current_package,
+                        allow_private_spec_types,
                         allow_package_body_types,
                         "record field type",
                         record.position,
@@ -1114,6 +1218,7 @@ impl<'a> Validator<'a> {
                 self.validate_type_reference_visible(
                     &range_type.base,
                     current_package,
+                    allow_private_spec_types,
                     allow_package_body_types,
                     "range base type",
                     range_type.position,
@@ -1123,6 +1228,7 @@ impl<'a> Validator<'a> {
                 self.validate_type_reference_visible(
                     &array_type.element_type,
                     current_package,
+                    allow_private_spec_types,
                     allow_package_body_types,
                     "array element type",
                     array_type.position,
@@ -1138,6 +1244,7 @@ impl<'a> Validator<'a> {
         &self,
         name: &Name,
         current_package: Option<&str>,
+        allow_private_spec_types: bool,
         allow_package_body_types: bool,
         context: &str,
         position: Position,
@@ -1151,7 +1258,12 @@ impl<'a> Validator<'a> {
             ));
         }
         self.validate_unqualified_type_name_unambiguous(name, current_package, position)?;
-        match self.type_reference_visibility(name, current_package, allow_package_body_types) {
+        match self.type_reference_visibility(
+            name,
+            current_package,
+            allow_private_spec_types,
+            allow_package_body_types,
+        ) {
             TypeReferenceVisibility::Visible | TypeReferenceVisibility::Unknown => Ok(()),
             TypeReferenceVisibility::Private => Err(Diagnostic::new(
                 format!("type `{}` is not visible in {context}", name.as_string()),
@@ -1164,12 +1276,14 @@ impl<'a> Validator<'a> {
         &self,
         name: &Name,
         current_package: Option<&str>,
+        allow_private_spec_types: bool,
         allow_package_body_types: bool,
     ) -> TypeReferenceVisibility {
         if name.segments.len() == 1 {
             return self.unqualified_type_reference_visibility(
                 &name.segments[0],
                 current_package,
+                allow_private_spec_types,
                 allow_package_body_types,
             );
         }
@@ -1187,6 +1301,15 @@ impl<'a> Validator<'a> {
             {
                 return TypeReferenceVisibility::Visible;
             }
+            if allow_private_spec_types
+                && self
+                    .summary
+                    .package_private_spec_types
+                    .get(&package_name)
+                    .is_some_and(|types| types.contains(&type_name))
+            {
+                return TypeReferenceVisibility::Visible;
+            }
             if allow_package_body_types
                 && self
                     .summary
@@ -1195,6 +1318,14 @@ impl<'a> Validator<'a> {
                     .is_some_and(|types| types.contains(&type_name))
             {
                 return TypeReferenceVisibility::Visible;
+            }
+            if self
+                .summary
+                .package_private_spec_types
+                .get(&package_name)
+                .is_some_and(|types| types.contains(&type_name))
+            {
+                return TypeReferenceVisibility::Private;
             }
             if self
                 .summary
@@ -1233,6 +1364,7 @@ impl<'a> Validator<'a> {
         &self,
         name: &str,
         current_package: Option<&str>,
+        allow_private_spec_types: bool,
         allow_package_body_types: bool,
     ) -> TypeReferenceVisibility {
         if builtin_type_names().contains(&name) || self.summary.top_level_types.contains(name) {
@@ -1249,6 +1381,16 @@ impl<'a> Validator<'a> {
                 return TypeReferenceVisibility::Visible;
             }
 
+            if allow_private_spec_types
+                && self
+                    .summary
+                    .package_private_spec_types
+                    .get(package_name)
+                    .is_some_and(|types| types.contains(name))
+            {
+                return TypeReferenceVisibility::Visible;
+            }
+
             if allow_package_body_types
                 && self
                     .summary
@@ -1257,6 +1399,15 @@ impl<'a> Validator<'a> {
                     .is_some_and(|types| types.contains(name))
             {
                 return TypeReferenceVisibility::Visible;
+            }
+
+            if self
+                .summary
+                .package_private_spec_types
+                .get(package_name)
+                .is_some_and(|types| types.contains(name))
+            {
+                return TypeReferenceVisibility::Private;
             }
 
             if self
@@ -1286,6 +1437,15 @@ impl<'a> Validator<'a> {
 
         if self.source_context.uses.iter().any(|package_name| {
             self.summary
+                .package_private_spec_types
+                .get(package_name)
+                .is_some_and(|types| types.contains(name))
+        }) {
+            return TypeReferenceVisibility::Private;
+        }
+
+        if self.source_context.uses.iter().any(|package_name| {
+            self.summary
                 .package_body_types
                 .get(package_name)
                 .is_some_and(|types| types.contains(name))
@@ -1309,14 +1469,24 @@ impl<'a> Validator<'a> {
         }
 
         !contains_signature(
-            &package_summary.spec_subprograms,
+            &package_summary.visible_spec_subprograms,
             &SignatureKey::from_subprogram(subprogram),
         )
     }
 
-    fn package_scope(&self, package_name: &str, include_body_values: bool) -> Scope {
+    fn package_scope(
+        &self,
+        package_name: &str,
+        include_private_spec_values: bool,
+        include_body_values: bool,
+    ) -> Scope {
         let mut scope = Scope::default();
         if let Some(values) = self.summary.package_spec_values.get(package_name) {
+            scope.extend_values(values);
+        }
+        if include_private_spec_values
+            && let Some(values) = self.summary.package_private_spec_values.get(package_name)
+        {
             scope.extend_values(values);
         }
         if include_body_values
@@ -1674,6 +1844,7 @@ impl<'a> Validator<'a> {
                         decl,
                         &scope,
                         current_package,
+                        current_package.is_some(),
                         current_package.is_some(),
                     )?;
                     register_case_distinct_spelling(
@@ -2072,7 +2243,7 @@ impl<'a> Validator<'a> {
             return InferredType::Unknown;
         };
         match self
-            .package_enum_literal_types(&package_name, &member_name)
+            .visible_package_enum_literal_types(&package_name, &member_name, current_package)
             .as_slice()
         {
             [ty] => InferredType::Known(ty.clone()),
@@ -2105,7 +2276,7 @@ impl<'a> Validator<'a> {
 
             return Ok(
                 match self
-                    .package_enum_literal_types(&package_name, member)
+                    .visible_package_enum_literal_types(&package_name, member, current_package)
                     .as_slice()
                 {
                     [ty] => InferredType::Known(ty.clone()),
@@ -4248,11 +4419,11 @@ impl<'a> Validator<'a> {
             .unwrap_or_default();
 
         if let Some(package_name) = current_package {
-            types.extend(self.package_enum_literal_types(package_name, literal));
+            types.extend(self.package_internal_enum_literal_types(package_name, literal));
         }
 
         for package_name in &self.source_context.uses {
-            types.extend(self.package_enum_literal_types(package_name, literal));
+            types.extend(self.package_public_enum_literal_types(package_name, literal));
         }
 
         types.sort();
@@ -4260,7 +4431,11 @@ impl<'a> Validator<'a> {
         types
     }
 
-    fn package_enum_literal_types(&self, package_name: &str, literal: &str) -> Vec<String> {
+    fn package_internal_enum_literal_types(
+        &self,
+        package_name: &str,
+        literal: &str,
+    ) -> Vec<String> {
         self.summary
             .package_enum_literal_types
             .get(package_name)
@@ -4272,6 +4447,33 @@ impl<'a> Validator<'a> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn package_public_enum_literal_types(&self, package_name: &str, literal: &str) -> Vec<String> {
+        self.summary
+            .package_public_enum_literal_types
+            .get(package_name)
+            .and_then(|types| types.get(literal))
+            .map(|type_names| {
+                type_names
+                    .iter()
+                    .map(|type_name| format!("{package_name}.{type_name}"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn visible_package_enum_literal_types(
+        &self,
+        package_name: &str,
+        literal: &str,
+        current_package: Option<&str>,
+    ) -> Vec<String> {
+        if current_package.is_some_and(|current_package| current_package == package_name) {
+            self.package_internal_enum_literal_types(package_name, literal)
+        } else {
+            self.package_public_enum_literal_types(package_name, literal)
+        }
     }
 
     fn types_are_compatible(
@@ -4511,7 +4713,7 @@ impl<'a> Validator<'a> {
         self.source_context
             .uses
             .iter()
-            .filter_map(|name| self.summary.package_enum_literals.get(name))
+            .filter_map(|name| self.summary.package_public_enum_literals.get(name))
             .collect()
     }
 
@@ -4641,17 +4843,12 @@ struct PackageCollections<'a> {
 }
 
 fn collect_package_items(
-    package: &Package,
+    package_name: &str,
+    items: &[PackageItem],
+    scope_name: &str,
     source_index: usize,
     collections: PackageCollections<'_>,
 ) -> Result<(), Diagnostic> {
-    let package_name = package.name.as_string();
-    let scope_name = if package.is_body {
-        format!("package body `{package_name}`")
-    } else {
-        format!("package `{package_name}`")
-    };
-
     let PackageCollections {
         signatures,
         subprogram_spellings,
@@ -4665,7 +4862,7 @@ fn collect_package_items(
         enum_literal_types,
     } = collections;
 
-    for item in &package.items {
+    for item in items {
         match item {
             PackageItem::Subprogram(subprogram) => {
                 register_case_distinct_spelling(
@@ -4679,15 +4876,15 @@ fn collect_package_items(
                     SubprogramSignature::from_subprogram(
                         subprogram,
                         source_index,
-                        Some(&package_name),
+                        Some(package_name),
                     ),
                     subprogram.position,
                     &format!("duplicate subprogram signature in {scope_name}"),
                 )?;
             }
             PackageItem::Type(type_decl) => {
-                validate_type_decl_case_distinct(type_decl, type_spellings, &scope_name)?;
-                validate_type_decl(type_decl, type_names, &scope_name)?;
+                validate_type_decl_case_distinct(type_decl, type_spellings, scope_name)?;
+                validate_type_decl(type_decl, type_names, scope_name)?;
                 collect_type_names(type_decl, section_type_names);
                 collect_type_symbols(type_decl, type_names, enum_literals);
                 collect_type_metadata(type_decl, type_kinds, enum_literal_types);
@@ -4853,8 +5050,94 @@ fn validate_type_decl_case_distinct(
     Ok(())
 }
 
+const ADA_RESERVED_WORDS: &[&str] = &[
+    "abort",
+    "abs",
+    "abstract",
+    "accept",
+    "access",
+    "aliased",
+    "all",
+    "and",
+    "array",
+    "at",
+    "begin",
+    "body",
+    "case",
+    "constant",
+    "declare",
+    "delay",
+    "delta",
+    "digits",
+    "do",
+    "else",
+    "elsif",
+    "end",
+    "entry",
+    "exception",
+    "exit",
+    "for",
+    "function",
+    "generic",
+    "goto",
+    "if",
+    "in",
+    "interface",
+    "is",
+    "limited",
+    "loop",
+    "mod",
+    "new",
+    "not",
+    "null",
+    "of",
+    "or",
+    "others",
+    "out",
+    "overriding",
+    "package",
+    "pragma",
+    "private",
+    "procedure",
+    "protected",
+    "raise",
+    "range",
+    "record",
+    "rem",
+    "renames",
+    "requeue",
+    "return",
+    "reverse",
+    "select",
+    "separate",
+    "some",
+    "subtype",
+    "synchronized",
+    "tagged",
+    "task",
+    "terminate",
+    "then",
+    "type",
+    "until",
+    "use",
+    "when",
+    "while",
+    "with",
+    "xor",
+];
+
 fn casefold_identifier(name: &str) -> String {
     name.to_ascii_lowercase()
+}
+
+fn ada_reserved_word_segment(name: &str) -> Option<&'static str> {
+    name.split('.').find_map(|segment| {
+        let folded = casefold_identifier(segment);
+        ADA_RESERVED_WORDS
+            .iter()
+            .copied()
+            .find(|reserved| *reserved == folded)
+    })
 }
 
 fn register_case_distinct_spelling(
@@ -4863,6 +5146,15 @@ fn register_case_distinct_spelling(
     position: Position,
     context: &str,
 ) -> Result<(), Diagnostic> {
+    if let Some(reserved_word) = ada_reserved_word_segment(name) {
+        return Err(Diagnostic::new(
+            format!(
+                "{context} `{name}` uses Ada reserved word `{reserved_word}` and cannot be used as an identifier"
+            ),
+            position,
+        ));
+    }
+
     let folded = casefold_identifier(name);
     if let Some(existing) = seen_spellings.get(&folded) {
         if existing != name {

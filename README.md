@@ -28,13 +28,12 @@ cargo build
 
 ### Transpile and run an example
 
-This transpiles CADA into split Ada units, then builds and runs the result with
-GNAT:
+This transpiles CADA into split Ada units and builds them with GNAT in one
+command:
 
 ```bash
-cargo run -- --write --split-units --out-dir build/hello examples/01_hello_world.cada
+cargo run -- --write --split-units --build --out-dir build/hello examples/01_hello_world.cada
 cd build/hello
-gnatmake -q main.adb
 ./main
 ```
 
@@ -53,8 +52,12 @@ cargo install cadar
 Then use it directly:
 
 ```bash
-cadar --write --split-units --out-dir build/hello examples/01_hello_world.cada
+cadar --write --split-units --build --out-dir build/hello examples/01_hello_world.cada
 ```
+
+If you want a GNAT project file for `gprbuild`, `gnatprove`, or other project
+driven tooling, add `--emit-project`. That writes `cadar.gpr` beside the
+generated Ada units.
 
 ## What Is Implemented
 
@@ -80,6 +83,7 @@ The current compiler is a real end-to-end pipeline:
 - qualified names and a small attribute surface such as `Integer.image(X)`
 - named call arguments and defaulted parameters
 - aggregate output or split-unit Ada file emission
+- optional `cadar.gpr` emission for split-unit GNAT project workflows
 - GNAT-backed integration tests, including the repository examples and
   multi-file package graphs
 
@@ -101,6 +105,8 @@ Important current limit:
   package or use aggregate output instead
 - identifiers that differ only by case are rejected, because Ada treats them as
   the same name
+- user-defined identifiers must avoid Ada reserved words such as `record`,
+  `task`, or `end`
 - external package-qualified references should be explicit: add `import P;` or
   `use P;` before referring to `P.X`
 - external top-level subprogram calls should also be explicit: add

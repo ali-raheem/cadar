@@ -1,0 +1,34 @@
+import Text_IO;
+use Text_IO;
+import Metrics;
+
+package Metrics {
+    fn Read() -> Integer;
+
+    private {
+        Integer Hidden_Total = 2;
+
+        type Hidden = record {
+            Integer Value;
+        };
+
+        fn Boost(Hidden Data) -> Integer;
+    }
+}
+
+package body Metrics {
+    fn Read() -> Integer {
+        Hidden Data;
+        Data.Value = Hidden_Total;
+        return Boost(Data);
+    }
+
+    fn Boost(Hidden Data) -> Integer {
+        Hidden_Total = Hidden_Total + 1;
+        return Data.Value + Hidden_Total;
+    }
+}
+
+fn Main() {
+    Put_Line(Integer.image(Metrics.Read()));
+}
