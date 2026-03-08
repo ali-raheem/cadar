@@ -31,6 +31,7 @@ fn gnat_compiles_and_runs_repository_examples() {
         "17_arrays_of_records",
         "18_matrix_trace",
         "19_inventory_report",
+        "20_stateful_contracts",
     ] {
         run_repository_example(stem);
     }
@@ -493,6 +494,120 @@ fn gnat_compiles_multi_file_inventory_reporting_program() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), " 29\n 2\n 5\n");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_compiles_multi_file_stateful_contract_program() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-stateful-contracts");
+    let warehouse_path = root.join("warehouse.cada");
+    let reports_path = root.join("reports.cada");
+    let main_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &warehouse_path,
+        r#"
+        package Warehouse {
+            type Item = record {
+                Integer Quantity;
+                Integer Limit;
+            };
+
+            Integer Restocked_Count = 0;
+
+            fn Needs_Restock(Item Value) -> Boolean
+                ensures(result or else Value.Quantity >= Value.Limit);
+
+            fn Restock(Item Value, Integer Extra = 1; Item Updated)
+                requires(Extra > 0)
+                global(in_out => Restocked_Count)
+                depends(Updated => [Value, Extra], Restocked_Count => [Restocked_Count, Extra])
+                ensures(Updated.Quantity >= Value.Quantity);
+        }
+
+        package body Warehouse {
+            fn Needs_Restock(Item Value) -> Boolean {
+                return Value.Quantity < Value.Limit;
+            }
+
+            fn Restock(Item Value, Integer Extra = 1; Item Updated) {
+                Updated = Value;
+                if (Needs_Restock(Value)) {
+                    Updated.Quantity = Updated.Quantity + Extra;
+                    Restocked_Count = Restocked_Count + 1;
+                }
+            }
+        }
+        "#,
+    )
+    .expect("warehouse input should be written");
+    fs::write(
+        &reports_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Warehouse;
+
+        package Reports {
+            fn Show_Item(Warehouse.Item Value);
+            fn Show_Count();
+        }
+
+        package body Reports {
+            fn Show_Item(Warehouse.Item Value) {
+                Put_Line(Integer.image(Value.Quantity));
+            }
+
+            fn Show_Count() {
+                Put_Line(Integer.image(Warehouse.Restocked_Count));
+            }
+        }
+        "#,
+    )
+    .expect("reports input should be written");
+    fs::write(
+        &main_path,
+        r#"
+        import Text_IO;
+        use Text_IO;
+        import Reports;
+        import Warehouse;
+
+        fn Main() {
+            Warehouse.Item First = Warehouse.Item { Quantity = 1, Limit = 3 };
+            Warehouse.Item Second = Warehouse.Item { Quantity = 0, Limit = 1 };
+            Warehouse.Item Updated_First;
+            Warehouse.Item Updated_Second;
+
+            Warehouse.Restock(First, Extra = 4, Updated = Updated_First);
+            Warehouse.Restock(Second, Updated = Updated_Second);
+
+            Reports.Show_Item(Updated_First);
+            Reports.Show_Item(Updated_Second);
+            Reports.Show_Count();
+
+            if (!Warehouse.Needs_Restock(Updated_Second)) {
+                Put_Line("stable");
+            }
+        }
+        "#,
+    )
+    .expect("main input should be written");
+
+    run_cadar_split_many(&[&warehouse_path, &reports_path, &main_path], &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary(&out_dir, "main");
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        " 5\n 1\n 2\nstable\n"
+    );
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }

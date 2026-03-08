@@ -43,5 +43,8 @@ the calling source so visibility matches Ada library-unit behavior.
 - `19_inventory_report.cada`: a larger package-based flow with shared package
   types across packages, record arrays, nested aggregates, named arguments,
   defaults, loops, and cross-package calls.
+- `20_stateful_contracts.cada`: package state plus contracts shared across
+  packages, including record types, pre/postconditions, dataflow aspects, and
+  reporting over public package state.
 
 Expected stdout for each example lives in the matching `.stdout` file.

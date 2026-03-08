@@ -1,0 +1,69 @@
+import Text_IO;
+use Text_IO;
+import Reports;
+import Warehouse;
+
+package Warehouse {
+    type Item = record {
+        Integer Quantity;
+        Integer Limit;
+    };
+
+    Integer Restocked_Count = 0;
+
+    fn Needs_Restock(Item Value) -> Boolean
+        ensures(result or else Value.Quantity >= Value.Limit);
+
+    fn Restock(Item Value, Integer Extra = 1; Item Updated)
+        requires(Extra > 0)
+        global(in_out => Restocked_Count)
+        depends(Updated => [Value, Extra], Restocked_Count => [Restocked_Count, Extra])
+        ensures(Updated.Quantity >= Value.Quantity);
+}
+
+package body Warehouse {
+    fn Needs_Restock(Item Value) -> Boolean {
+        return Value.Quantity < Value.Limit;
+    }
+
+    fn Restock(Item Value, Integer Extra = 1; Item Updated) {
+        Updated = Value;
+        if (Needs_Restock(Value)) {
+            Updated.Quantity = Updated.Quantity + Extra;
+            Restocked_Count = Restocked_Count + 1;
+        }
+    }
+}
+
+package Reports {
+    fn Show_Item(Warehouse.Item Value);
+    fn Show_Count();
+}
+
+package body Reports {
+    fn Show_Item(Warehouse.Item Value) {
+        Put_Line(Integer.image(Value.Quantity));
+    }
+
+    fn Show_Count() {
+        Put_Line(Integer.image(Warehouse.Restocked_Count));
+    }
+}
+
+fn Main() {
+    Warehouse.Item First = Warehouse.Item { Quantity = 1, Limit = 3 };
+    Warehouse.Item Second = Warehouse.Item { Quantity = 0, Limit = 1 };
+    Warehouse.Item Updated_First;
+    Warehouse.Item Updated_Second;
+
+    Warehouse.Restock(First, Extra = 4, Updated = Updated_First);
+    Warehouse.Restock(Second, Updated = Updated_Second);
+
+    Reports.Show_Item(Updated_First);
+    Reports.Show_Item(Updated_Second);
+    Reports.Show_Count();
+
+    if (!Warehouse.Needs_Restock(Updated_Second)) {
+        Put_Line("stable");
+    }
+}
