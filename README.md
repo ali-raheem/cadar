@@ -68,10 +68,11 @@ The current compiler is a real end-to-end pipeline:
 - lexer, parser, AST, semantic validation, Ada lowering, pretty-printing, and CLI
 - one or more `.cada` input files per CLI invocation
 - functions and procedures, including grouped parameter modes
-- imports and `use`
+- imports and `use`, including package aliases with `import ... as ...`
 - local declarations, including nested control-flow block locals, constants,
   assignments, procedure `return;`, value returns, and call statements
 - control flow: `if`, `while`, `for`, `case`, `null`, `break`, and `continue`
+- exceptions with `raise`, `try`, `catch`, and `catch (others)`
 - body assertions with `assert(...)`
 - loop invariants and loop variants
 - SPARK-style dataflow contracts with `global(...)` and `depends(...)`
@@ -79,10 +80,11 @@ The current compiler is a real end-to-end pipeline:
   helper subprograms, and derived specs for body-only packages
 - contracts with `requires(...)` and `ensures(...)`
 - record types, enum types, and range subtypes
-- record aggregates, constrained arrays, array literals, indexing, and nested
-  aggregates such as arrays of records and arrays of arrays
+- record aggregates, constrained arrays, array literals, indexing, slicing, and
+  nested aggregates such as arrays of records and arrays of arrays
 - float and character literals
-- qualified names and a small attribute surface such as `Integer.image(X)`
+- qualified names and array/string attributes such as `.first`, `.last`,
+  `.length`, `.range`, and `Integer.image(X)`
 - named call arguments and defaulted parameters
 - aggregate output or split-unit Ada file emission
 - optional `cadar.gpr` emission for split-unit GNAT project workflows
@@ -127,7 +129,8 @@ Important remaining work includes:
 - richer name resolution and more precise type checking
 - more complete expression and type coverage
 - more SPARK-oriented features such as `Refined_Post`
-- more Ada coverage: private/tagged types, generics, exceptions, and tasking
+- more Ada coverage: private/tagged types, generics, richer exception support,
+  and tasking
 - tighter source mapping, better diagnostics, and more output/toolchain polish
 - optional `gnatprove` integration
 

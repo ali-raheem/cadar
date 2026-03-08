@@ -1,0 +1,10 @@
+import Text_IO as IO;
+import Ada.Command_Line as CLI;
+
+fn Main() {
+    if (CLI.Argument_Count() == 0) {
+        IO.Put_Line("no args");
+    } else {
+        IO.Put_Line("args");
+    }
+}

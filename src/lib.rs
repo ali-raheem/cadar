@@ -112,6 +112,26 @@ mod tests {
     }
 
     #[test]
+    fn transpiles_import_aliases_to_canonical_ada() {
+        let output = transpile(
+            r#"
+            import Text_IO as IO;
+
+            fn Main() {
+                IO.Put_Line("Hello");
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(output.spec, "with Text_IO;\n\nprocedure Main;");
+        assert_eq!(
+            output.body,
+            "with Text_IO;\n\nprocedure Main is\nbegin\n   Text_IO.Put_Line(\"Hello\");\nend Main;"
+        );
+    }
+
+    #[test]
     fn transpiles_grouped_parameter_modes_and_local_declarations() {
         let output = transpile(
             r#"
@@ -622,6 +642,32 @@ mod tests {
     }
 
     #[test]
+    fn transpiles_raise_and_try_catch_statements() {
+        let output = transpile(
+            r#"
+            import Text_IO as IO;
+
+            fn Main() {
+                try {
+                    raise Constraint_Error;
+                } catch (Constraint_Error) {
+                    IO.Put_Line("handled");
+                } catch (others) {
+                    IO.Put_Line("other");
+                }
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(output.spec, "with Text_IO;\n\nprocedure Main;");
+        assert_eq!(
+            output.body,
+            "with Text_IO;\n\nprocedure Main is\nbegin\n   begin\n      raise Constraint_Error;\n   exception\n      when Constraint_Error =>\n         Text_IO.Put_Line(\"handled\");\n      when others =>\n         Text_IO.Put_Line(\"other\");\n   end;\nend Main;"
+        );
+    }
+
+    #[test]
     fn transpiles_loop_invariants_and_variants() {
         let output = transpile(
             r#"
@@ -1109,6 +1155,27 @@ mod tests {
         assert!(
             error.message.contains(
                 "`import Buffer` is not valid because `Buffer` is a top-level type, not a library unit"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_aliasing_top_level_subprogram_imports() {
+        let error = transpile(
+            r#"
+            import Add as Sum;
+
+            fn Add(Integer A, Integer B) -> Integer {
+                return A + B;
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error.message.contains(
+                "`import Add as Sum` is not valid because aliases are only supported for packages, and `Add` is a top-level subprogram"
             ),
             "unexpected error: {error}"
         );
@@ -1717,6 +1784,49 @@ mod tests {
         assert_eq!(
             output.body,
             "procedure Describe(X : Integer; Data : Buffer) is\nbegin\n   Text_IO.Put_Line(Integer'Image(X));\n   Print_Length(Data'Length);\n   Print_Range(Data'Range);\nend Describe;"
+        );
+    }
+
+    #[test]
+    fn transpiles_first_last_and_slice_expressions() {
+        let output = transpile(
+            r#"
+            import Text_IO;
+
+            fn Show(String Text) {
+                Print_Bounds(Text.first, Text.last);
+                Text_IO.Put_Line(Text[Text.first + 1..Text.last]);
+            }
+            "#,
+        )
+        .expect("transpile should succeed");
+
+        assert_eq!(
+            output.spec,
+            "with Text_IO;\n\nprocedure Show(Text : String);"
+        );
+        assert_eq!(
+            output.body,
+            "with Text_IO;\n\nprocedure Show(Text : String) is\nbegin\n   Print_Bounds(Text'First, Text'Last);\n   Text_IO.Put_Line(Text(Text'First + 1 .. Text'Last));\nend Show;"
+        );
+    }
+
+    #[test]
+    fn rejects_slicing_non_arrays() {
+        let error = transpile(
+            r#"
+            fn Main(Integer Value) {
+                Text_IO.Put_Line(Value[0..1]);
+            }
+            "#,
+        )
+        .expect_err("transpile should fail");
+
+        assert!(
+            error
+                .message
+                .contains("sliced expression must be an array, found `Integer`"),
+            "unexpected error: {error}"
         );
     }
 

@@ -5,9 +5,10 @@ use std::{
 
 use crate::{
     ast::{
-        BinaryOp, BlockItem, CallArg, CaseStatement, DependTarget, DependsContract, Expr,
-        GlobalContract, Item, LocalDecl, Name, Package, PackageItem, ParamMode, Program,
-        RecordFieldInit, Statement, StatementBlock, Subprogram, TypeDecl, UnaryOp,
+        BinaryOp, BlockItem, CallArg, CaseStatement, DependTarget, DependsContract,
+        ExceptionSelector, Expr, GlobalContract, Item, LocalDecl, Name, Package, PackageItem,
+        ParamMode, Program, RecordFieldInit, Statement, StatementBlock, Subprogram, TypeDecl,
+        UnaryOp,
     },
     diagnostic::{Diagnostic, IndexedDiagnostic, Position},
 };
@@ -667,25 +668,49 @@ impl<'a> Validator<'a> {
 
     fn validate_program(&self, program: &Program) -> Result<(), Diagnostic> {
         let mut saw_non_context_item = false;
+        let mut context_alias_spellings = HashMap::new();
+        let mut context_alias_targets = HashMap::new();
         for item in &program.items {
             match item {
-                Item::Import { name, position } => {
+                Item::Import {
+                    name,
+                    alias,
+                    position,
+                } => {
                     if saw_non_context_item {
                         return Err(Diagnostic::new(
                             "`import` clauses must appear before top-level declarations",
                             *position,
                         ));
                     }
-                    self.validate_import(name, *position)?;
+                    self.validate_context_alias(
+                        alias.as_deref(),
+                        name,
+                        *position,
+                        &mut context_alias_spellings,
+                        &mut context_alias_targets,
+                    )?;
+                    self.validate_import(name, alias.as_deref(), *position)?;
                 }
-                Item::Use { name, position } => {
+                Item::Use {
+                    name,
+                    alias,
+                    position,
+                } => {
                     if saw_non_context_item {
                         return Err(Diagnostic::new(
                             "`use` clauses must appear before top-level declarations",
                             *position,
                         ));
                     }
-                    self.validate_use(name, *position)?;
+                    self.validate_context_alias(
+                        alias.as_deref(),
+                        name,
+                        *position,
+                        &mut context_alias_spellings,
+                        &mut context_alias_targets,
+                    )?;
+                    self.validate_use(name, alias.as_deref(), *position)?;
                 }
                 Item::Subprogram(subprogram) => {
                     saw_non_context_item = true;
@@ -705,7 +730,43 @@ impl<'a> Validator<'a> {
         Ok(())
     }
 
-    fn validate_import(&self, name: &Name, position: Position) -> Result<(), Diagnostic> {
+    fn validate_context_alias(
+        &self,
+        alias: Option<&str>,
+        target: &Name,
+        position: Position,
+        seen_spellings: &mut HashMap<String, String>,
+        seen_targets: &mut HashMap<String, String>,
+    ) -> Result<(), Diagnostic> {
+        let Some(alias) = alias else {
+            return Ok(());
+        };
+
+        register_case_distinct_spelling(seen_spellings, alias, position, "context alias")?;
+        let folded = casefold_identifier(alias);
+        let target_name = target.as_string();
+        if let Some(existing_target) = seen_targets.get(&folded) {
+            if existing_target != &target_name {
+                return Err(Diagnostic::new(
+                    format!(
+                        "context alias `{alias}` is already bound to `{existing_target}` and cannot also name `{target_name}`"
+                    ),
+                    position,
+                ));
+            }
+        } else {
+            seen_targets.insert(folded, target_name);
+        }
+
+        Ok(())
+    }
+
+    fn validate_import(
+        &self,
+        name: &Name,
+        alias: Option<&str>,
+        position: Position,
+    ) -> Result<(), Diagnostic> {
         if let Some(package_name) = self.known_package_member_context_target(name) {
             return Err(Diagnostic::new(
                 format!(
@@ -728,10 +789,37 @@ impl<'a> Validator<'a> {
             ));
         }
 
+        if alias.is_some()
+            && name.segments.len() == 1
+            && (self
+                .summary
+                .top_level_declarations
+                .contains_key(&name.segments[0])
+                || self
+                    .summary
+                    .top_level_definitions
+                    .contains_key(&name.segments[0]))
+        {
+            return Err(Diagnostic::new(
+                format!(
+                    "`import {} as {}` is not valid because aliases are only supported for packages, and `{}` is a top-level subprogram",
+                    name.as_string(),
+                    alias.unwrap_or_default(),
+                    name.as_string()
+                ),
+                position,
+            ));
+        }
+
         Ok(())
     }
 
-    fn validate_use(&self, name: &Name, position: Position) -> Result<(), Diagnostic> {
+    fn validate_use(
+        &self,
+        name: &Name,
+        _alias: Option<&str>,
+        position: Position,
+    ) -> Result<(), Diagnostic> {
         if let Some(package_name) = self.known_package_member_context_target(name) {
             return Err(Diagnostic::new(
                 format!(
@@ -1073,6 +1161,7 @@ impl<'a> Validator<'a> {
     ) -> bool {
         match statement {
             Statement::Return { expr: Some(_), .. } => true,
+            Statement::Raise { .. } => true,
             Statement::Null { .. }
             | Statement::Break { .. }
             | Statement::Continue { .. }
@@ -1082,6 +1171,16 @@ impl<'a> Validator<'a> {
             | Statement::Expr { .. }
             | Statement::While { .. }
             | Statement::For(_) => false,
+            Statement::Try(try_statement) => {
+                self.statement_block_guarantees_return(&try_statement.body, scope, current_package)
+                    && try_statement.handlers.iter().all(|handler| {
+                        self.statement_block_guarantees_return(
+                            &handler.body,
+                            scope,
+                            current_package,
+                        )
+                    })
+            }
             Statement::If(if_statement) => {
                 self.statement_block_guarantees_return(
                     &if_statement.then_branch,
@@ -1576,6 +1675,10 @@ impl<'a> Validator<'a> {
     ) -> Result<(), Diagnostic> {
         match statement {
             Statement::Null { .. } => Ok(()),
+            Statement::Raise {
+                exception,
+                position,
+            } => self.validate_exception_name(exception, *position, current_package),
             Statement::Break { position } => {
                 if scope.in_loop() {
                     Ok(())
@@ -1629,6 +1732,26 @@ impl<'a> Validator<'a> {
                 }
                 self.validate_expr(expr, scope, current_package)?;
                 self.validate_standalone_call(expr, scope, current_package)
+            }
+            Statement::Try(try_statement) => {
+                self.validate_statement_block(
+                    &try_statement.body,
+                    expected_return_type,
+                    scope,
+                    current_package,
+                )?;
+                for handler in &try_statement.handlers {
+                    if let ExceptionSelector::Name(name) = &handler.selector {
+                        self.validate_exception_name(name, handler.position, current_package)?;
+                    }
+                    self.validate_statement_block(
+                        &handler.body,
+                        expected_return_type,
+                        scope,
+                        current_package,
+                    )?;
+                }
+                Ok(())
             }
             Statement::Assign {
                 target,
@@ -1817,6 +1940,24 @@ impl<'a> Validator<'a> {
                 )
             }
         }
+    }
+
+    fn validate_exception_name(
+        &self,
+        name: &Name,
+        position: Position,
+        current_package: Option<&str>,
+    ) -> Result<(), Diagnostic> {
+        if let Some(package_name) = self.hidden_known_package(name, current_package) {
+            return Err(Diagnostic::new(
+                format!(
+                    "package `{package_name}` is not visible; add `import {package_name};` or `use {package_name};`"
+                ),
+                position,
+            ));
+        }
+
+        Ok(())
     }
 
     fn validate_statement_block(
@@ -2124,6 +2265,13 @@ impl<'a> Validator<'a> {
                 };
                 self.indexed_element_type(&base_type, current_package)
             }
+            Expr::Slice { base, .. } => {
+                let base_type = self.infer_expr_type(base, scope, current_package).ok()?;
+                let InferredType::Known(base_type) = base_type else {
+                    return None;
+                };
+                Some(base_type)
+            }
             Expr::Member { base, member, .. } => {
                 if let Some(package_name) = expr_to_name(base)
                     .filter(|name| self.is_visible_package_path(name, current_package))
@@ -2191,6 +2339,12 @@ impl<'a> Validator<'a> {
                 index,
                 position,
             } => self.infer_index_expr_type(base, index, *position, scope, current_package),
+            Expr::Slice {
+                base,
+                start,
+                end,
+                position,
+            } => self.infer_slice_expr_type(base, start, end, *position, scope, current_package),
             Expr::Call { callee, args, .. } => {
                 self.infer_call_type(callee, args, scope, current_package)
             }
@@ -2287,6 +2441,18 @@ impl<'a> Validator<'a> {
 
         let base_type = self.infer_expr_type(base, scope, current_package)?;
         match (member, base_type) {
+            ("first", InferredType::Known(base_type))
+            | ("last", InferredType::Known(base_type)) => {
+                match self.is_array_like_type(&base_type, current_package) {
+                    Some(true) | None => Ok(InferredType::Known("Integer".to_string())),
+                    Some(false) => Err(Diagnostic::new(
+                        format!(
+                            "attribute `{member}` requires an array value, found `{base_type}`"
+                        ),
+                        position,
+                    )),
+                }
+            }
             ("length", InferredType::Known(base_type)) => {
                 match self.is_array_like_type(&base_type, current_package) {
                     Some(true) | None => Ok(InferredType::Known("Integer".to_string())),
@@ -2330,12 +2496,13 @@ impl<'a> Validator<'a> {
                 "attribute `image` requires a type name, found array literal",
                 position,
             )),
-            ("length", InferredType::Aggregate(_)) | ("range", InferredType::Aggregate(_)) => {
-                Err(Diagnostic::new(
-                    format!("attribute `{member}` requires an array value, found array literal"),
-                    position,
-                ))
-            }
+            ("first", InferredType::Aggregate(_))
+            | ("last", InferredType::Aggregate(_))
+            | ("length", InferredType::Aggregate(_))
+            | ("range", InferredType::Aggregate(_)) => Err(Diagnostic::new(
+                format!("attribute `{member}` requires an array value, found array literal"),
+                position,
+            )),
             (_, InferredType::Aggregate(_)) => Err(Diagnostic::new(
                 format!("array literal has no field `{member}`"),
                 position,
@@ -2373,6 +2540,44 @@ impl<'a> Validator<'a> {
             }
             InferredType::Aggregate(_) => Err(Diagnostic::new(
                 "indexed expression must be an array, found array literal",
+                position,
+            )),
+            InferredType::Procedure => Err(Diagnostic::new(
+                "procedures do not produce a value",
+                position,
+            )),
+            InferredType::Unknown => Ok(InferredType::Unknown),
+        }
+    }
+
+    fn infer_slice_expr_type(
+        &self,
+        base: &Expr,
+        start: &Expr,
+        end: &Expr,
+        position: Position,
+        scope: &Scope,
+        current_package: Option<&str>,
+    ) -> Result<InferredType, Diagnostic> {
+        let base_type = self.infer_expr_type(base, scope, current_package)?;
+        let start_type = self.infer_expr_type(start, scope, current_package)?;
+        let end_type = self.infer_expr_type(end, scope, current_package)?;
+        self.ensure_numeric_operand(&start_type, position, "[]", current_package)?;
+        self.ensure_numeric_operand(&end_type, position, "[]", current_package)?;
+
+        match base_type {
+            InferredType::Known(base_type) => {
+                if self.is_array_like_type(&base_type, current_package) != Some(false) {
+                    Ok(InferredType::Known(base_type))
+                } else {
+                    Err(Diagnostic::new(
+                        format!("sliced expression must be an array, found `{base_type}`"),
+                        position,
+                    ))
+                }
+            }
+            InferredType::Aggregate(_) => Err(Diagnostic::new(
+                "sliced expression must be an array, found array literal",
                 position,
             )),
             InferredType::Procedure => Err(Diagnostic::new(
@@ -3204,6 +3409,15 @@ impl<'a> Validator<'a> {
                 self.infer_value_type(expr, scope, current_package)?;
                 Ok(())
             }
+            expr @ Expr::Slice {
+                base, start, end, ..
+            } => {
+                self.validate_expr(base, scope, current_package)?;
+                self.validate_expr(start, scope, current_package)?;
+                self.validate_expr(end, scope, current_package)?;
+                self.infer_value_type(expr, scope, current_package)?;
+                Ok(())
+            }
             Expr::Call { callee, args, .. } => {
                 for arg in args {
                     self.validate_expr(&arg.value, scope, current_package)?;
@@ -3740,6 +3954,15 @@ impl<'a> Validator<'a> {
                 self.infer_expr_type(target, scope, current_package)?;
                 Ok(())
             }
+            Expr::Slice {
+                base, start, end, ..
+            } => {
+                self.validate_assignment_target(base, position, scope, current_package)?;
+                self.validate_expr(start, scope, current_package)?;
+                self.validate_expr(end, scope, current_package)?;
+                self.infer_expr_type(target, scope, current_package)?;
+                Ok(())
+            }
             Expr::Bool { .. }
             | Expr::Integer { .. }
             | Expr::Float { .. }
@@ -3986,6 +4209,16 @@ impl<'a> Validator<'a> {
         current_package: Option<&str>,
     ) -> Result<InferredType, Diagnostic> {
         match member {
+            "first" | "last" => {
+                if self.is_array_like_type(type_name, current_package) == Some(true) {
+                    Ok(InferredType::Known("Integer".to_string()))
+                } else {
+                    Err(Diagnostic::new(
+                        format!("attribute `{member}` requires an array type, found `{type_name}`"),
+                        position,
+                    ))
+                }
+            }
             "length" => {
                 if self.is_array_like_type(type_name, current_package) == Some(true) {
                     Ok(InferredType::Known("Integer".to_string()))
@@ -5416,6 +5649,24 @@ fn exprs_match(lhs: &Expr, rhs: &Expr) -> bool {
             },
         ) => exprs_match(lhs_base, rhs_base) && exprs_match(lhs_index, rhs_index),
         (
+            Expr::Slice {
+                base: lhs_base,
+                start: lhs_start,
+                end: lhs_end,
+                ..
+            },
+            Expr::Slice {
+                base: rhs_base,
+                start: rhs_start,
+                end: rhs_end,
+                ..
+            },
+        ) => {
+            exprs_match(lhs_base, rhs_base)
+                && exprs_match(lhs_start, rhs_start)
+                && exprs_match(lhs_end, rhs_end)
+        }
+        (
             Expr::Call {
                 callee: lhs_callee,
                 args: lhs_args,
@@ -5644,7 +5895,7 @@ fn current_package_for_canonical(canonical_type: &str) -> Option<String> {
 }
 
 fn is_readonly_attribute(member: &str) -> bool {
-    matches!(member, "length" | "range" | "image")
+    matches!(member, "first" | "last" | "length" | "range" | "image")
 }
 
 fn display_expr(expr: &Expr) -> String {
@@ -5664,6 +5915,16 @@ fn display_expr(expr: &Expr) -> String {
         Expr::Member { base, member, .. } => format!("{}.{}", display_expr(base), member),
         Expr::Index { base, index, .. } => {
             format!("{}[{}]", display_expr(base), display_expr(index))
+        }
+        Expr::Slice {
+            base, start, end, ..
+        } => {
+            format!(
+                "{}[{}..{}]",
+                display_expr(base),
+                display_expr(start),
+                display_expr(end)
+            )
         }
         Expr::Call { .. } => display_callee(expr),
         Expr::RecordLiteral { ty, .. } => format!("{} {{ ... }}", ty.as_string()),
@@ -5708,6 +5969,11 @@ fn find_result_reference(expr: &Expr) -> Option<Position> {
         Expr::Index { base, index, .. } => {
             find_result_reference(base).or_else(|| find_result_reference(index))
         }
+        Expr::Slice {
+            base, start, end, ..
+        } => find_result_reference(base)
+            .or_else(|| find_result_reference(start))
+            .or_else(|| find_result_reference(end)),
         Expr::Call { callee, args, .. } => find_result_reference(callee).or_else(|| {
             args.iter()
                 .find_map(|arg| find_result_reference(&arg.value))

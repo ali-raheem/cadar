@@ -34,6 +34,9 @@ fn gnat_compiles_and_runs_repository_examples() {
         "20_stateful_contracts",
         "21_alert_pipeline",
         "22_private_package_sections",
+        "23_import_aliases",
+        "24_exceptions",
+        "25_string_slices",
     ] {
         run_repository_example(stem);
     }
@@ -265,6 +268,53 @@ fn gnat_compiles_boolean_logic_program() {
     let output = run_binary(&out_dir, "main");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
+
+    fs::remove_dir_all(root).expect("temp dir should be removed");
+}
+
+#[test]
+fn gnat_runs_string_slice_program_with_command_line_argument() {
+    if !gnatmake_available() {
+        return;
+    }
+
+    let root = temp_test_dir("gnat-string-slices");
+    let input_path = root.join("main.cada");
+    let out_dir = root.join("out");
+
+    fs::write(
+        &input_path,
+        r#"
+        import Text_IO as IO;
+        import Ada.Command_Line as CLI;
+        import Text_Util;
+
+        package Text_Util {
+            fn Middle(String Text) -> String;
+        }
+
+        package body Text_Util {
+            fn Middle(String Text) -> String {
+                if (Text.length <= 2) {
+                    return Text;
+                }
+
+                return Text[Text.first + 1..Text.last - 1];
+            }
+        }
+
+        fn Main() {
+            IO.Put_Line(Text_Util.Middle(CLI.Argument(1)));
+        }
+        "#,
+    )
+    .expect("input should be written");
+
+    run_cadar_split(&input_path, &out_dir);
+    run_gnatmake(&out_dir, "main.adb");
+    let output = run_binary_with_args(&out_dir, "main", &["spark"]);
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "par\n");
 
     fs::remove_dir_all(root).expect("temp dir should be removed");
 }
@@ -1139,7 +1189,12 @@ fn run_gnatmake(out_dir: &Path, unit: &str) {
 }
 
 fn run_binary(out_dir: &Path, name: &str) -> process::Output {
+    run_binary_with_args(out_dir, name, &[])
+}
+
+fn run_binary_with_args(out_dir: &Path, name: &str, args: &[&str]) -> process::Output {
     Command::new(out_dir.join(name))
+        .args(args)
         .current_dir(out_dir)
         .output()
         .expect("compiled binary should run")

@@ -52,5 +52,11 @@ the calling source so visibility matches Ada library-unit behavior.
 - `22_private_package_sections.cada`: package specs with a `private { ... }`
   section, including hidden types, hidden state, and private helper
   declarations consumed by the package body.
+- `23_import_aliases.cada`: package aliases with `import ... as ...`, including
+  aliases for external Ada packages like `Ada.Command_Line`.
+- `24_exceptions.cada`: `raise`, `try`, `catch`, and `catch (others)` lowered
+  to Ada exception handling blocks.
+- `25_string_slices.cada`: string slicing with `.first`, `.last`, `.length`,
+  package aliases, and a simple command-line driven text helper.
 
 Expected stdout for each example lives in the matching `.stdout` file.

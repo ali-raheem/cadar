@@ -1,0 +1,11 @@
+import Text_IO as IO;
+
+fn Main() {
+    try {
+        raise Constraint_Error;
+    } catch (Constraint_Error) {
+        IO.Put_Line("handled");
+    } catch (others) {
+        IO.Put_Line("other");
+    }
+}

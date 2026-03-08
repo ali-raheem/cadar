@@ -1,0 +1,26 @@
+import Text_IO as IO;
+import Ada.Command_Line as CLI;
+import Text_Util;
+
+package Text_Util {
+    fn Middle(String Text) -> String;
+}
+
+package body Text_Util {
+    fn Middle(String Text) -> String {
+        if (Text.length <= 2) {
+            return Text;
+        }
+
+        return Text[Text.first + 1..Text.last - 1];
+    }
+}
+
+fn Main() {
+    if (CLI.Argument_Count() == 0) {
+        IO.Put_Line(Text_Util.Middle("cadar"));
+        return;
+    }
+
+    IO.Put_Line(Text_Util.Middle(CLI.Argument(1)));
+}

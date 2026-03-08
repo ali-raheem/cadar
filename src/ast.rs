@@ -7,8 +7,16 @@ pub struct Program {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    Import { name: Name, position: Position },
-    Use { name: Name, position: Position },
+    Import {
+        name: Name,
+        alias: Option<String>,
+        position: Position,
+    },
+    Use {
+        name: Name,
+        alias: Option<String>,
+        position: Position,
+    },
     Subprogram(Subprogram),
     Type(TypeDecl),
     Package(Package),
@@ -191,6 +199,10 @@ pub enum Statement {
     Null {
         position: Position,
     },
+    Raise {
+        exception: Name,
+        position: Position,
+    },
     Break {
         position: Position,
     },
@@ -214,6 +226,7 @@ pub enum Statement {
         expr: Expr,
         position: Position,
     },
+    Try(TryStatement),
     If(IfStatement),
     Case(CaseStatement),
     While {
@@ -229,6 +242,26 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementBlock {
     pub items: Vec<BlockItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TryStatement {
+    pub body: StatementBlock,
+    pub handlers: Vec<ExceptionHandler>,
+    pub position: Position,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionHandler {
+    pub selector: ExceptionSelector,
+    pub body: StatementBlock,
+    pub position: Position,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExceptionSelector {
+    Name(Name),
+    Others,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +355,12 @@ pub enum Expr {
         index: Box<Expr>,
         position: Position,
     },
+    Slice {
+        base: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
+        position: Position,
+    },
     Call {
         callee: Box<Expr>,
         args: Vec<CallArg>,
@@ -360,6 +399,7 @@ impl Expr {
             | Self::Name { position, .. }
             | Self::Member { position, .. }
             | Self::Index { position, .. }
+            | Self::Slice { position, .. }
             | Self::Call { position, .. }
             | Self::RecordLiteral { position, .. }
             | Self::ArrayLiteral { position, .. }

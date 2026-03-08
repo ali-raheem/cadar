@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     ast::{
         ArrayType, BinaryOp, BlockItem, CaseStatement, DependTarget, DependsContract, EnumType,
-        Expr, ForStatement, GlobalContract, GlobalMode, IfStatement, Item, LocalDecl,
-        LoopVariantDirection, Name, Package, PackageItem, ParamMode, Program, RangeType,
+        ExceptionSelector, Expr, ForStatement, GlobalContract, GlobalMode, IfStatement, Item,
+        LocalDecl, LoopVariantDirection, Name, Package, PackageItem, ParamMode, Program, RangeType,
         RecordType, Statement, StatementBlock, Subprogram, TypeDecl, UnaryOp,
     },
     diagnostic::{Diagnostic, IndexedDiagnostic, Position},
@@ -217,6 +217,7 @@ pub struct AdaObjectDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdaStatement {
     Null,
+    Raise(Name),
     Exit,
     Continue,
     Block {
@@ -230,6 +231,10 @@ pub enum AdaStatement {
         value: AdaExpr,
     },
     Call(AdaExpr),
+    Try {
+        statements: Vec<AdaStatement>,
+        handlers: Vec<AdaExceptionHandler>,
+    },
     If(AdaIfStatement),
     Case(AdaCaseStatement),
     While {
@@ -252,6 +257,18 @@ pub enum AdaStatement {
 pub struct AdaLoopVariant {
     pub direction: AdaLoopVariantDirection,
     pub expr: AdaExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaExceptionHandler {
+    pub selector: AdaExceptionSelector,
+    pub body: Vec<AdaStatement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaExceptionSelector {
+    Name(Name),
+    Others,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +306,8 @@ pub struct AdaElseIfBranch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdaAttribute {
+    First,
+    Last,
     Length,
     Range,
     Image,
@@ -314,6 +333,11 @@ pub enum AdaExpr {
     Index {
         base: Box<AdaExpr>,
         index: Box<AdaExpr>,
+    },
+    Slice {
+        base: Box<AdaExpr>,
+        start: Box<AdaExpr>,
+        end: Box<AdaExpr>,
     },
     Attribute {
         prefix: Box<AdaExpr>,
@@ -776,6 +800,7 @@ fn lower_statement(
 ) -> Result<AdaStatement, Diagnostic> {
     match statement {
         Statement::Null { .. } => Ok(AdaStatement::Null),
+        Statement::Raise { exception, .. } => Ok(AdaStatement::Raise(exception)),
         Statement::Break { .. } => Ok(AdaStatement::Exit),
         Statement::Continue { .. } => Ok(AdaStatement::Continue),
         Statement::Assert { expr, .. } => Ok(AdaStatement::Assert(lower_expr(expr, lowering))),
@@ -797,6 +822,22 @@ fn lower_statement(
                 ))
             }
         }
+        Statement::Try(try_statement) => Ok(AdaStatement::Try {
+            statements: lower_statement_block(try_statement.body, lowering)?,
+            handlers: try_statement
+                .handlers
+                .into_iter()
+                .map(|handler| {
+                    Ok(AdaExceptionHandler {
+                        selector: match handler.selector {
+                            ExceptionSelector::Name(name) => AdaExceptionSelector::Name(name),
+                            ExceptionSelector::Others => AdaExceptionSelector::Others,
+                        },
+                        body: lower_statement_block(handler.body, lowering)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Diagnostic>>()?,
+        }),
         Statement::If(if_statement) => Ok(AdaStatement::If(lower_if_statement(
             if_statement,
             lowering,
@@ -867,7 +908,7 @@ fn lower_assignment_target(
     lowering: &LoweringContext<'_>,
 ) -> Result<AdaExpr, Diagnostic> {
     match target {
-        Expr::Name { .. } | Expr::Member { .. } | Expr::Index { .. } => {
+        Expr::Name { .. } | Expr::Member { .. } | Expr::Index { .. } | Expr::Slice { .. } => {
             Ok(lower_expr(target, lowering))
         }
         _ => Err(Diagnostic::new(
@@ -1019,6 +1060,14 @@ fn lower_expr_internal(
         Expr::Member { base, member, .. } => {
             let prefix = Box::new(lower_expr_internal(*base, contract, lowering)?);
             match member.as_str() {
+                "first" => Ok(AdaExpr::Attribute {
+                    prefix,
+                    attribute: AdaAttribute::First,
+                }),
+                "last" => Ok(AdaExpr::Attribute {
+                    prefix,
+                    attribute: AdaAttribute::Last,
+                }),
                 "length" => Ok(AdaExpr::Attribute {
                     prefix,
                     attribute: AdaAttribute::Length,
@@ -1037,6 +1086,13 @@ fn lower_expr_internal(
         Expr::Index { base, index, .. } => Ok(AdaExpr::Index {
             base: Box::new(lower_expr_internal(*base, contract, lowering)?),
             index: Box::new(lower_expr_internal(*index, contract, lowering)?),
+        }),
+        Expr::Slice {
+            base, start, end, ..
+        } => Ok(AdaExpr::Slice {
+            base: Box::new(lower_expr_internal(*base, contract, lowering)?),
+            start: Box::new(lower_expr_internal(*start, contract, lowering)?),
+            end: Box::new(lower_expr_internal(*end, contract, lowering)?),
         }),
         Expr::Call {
             callee,
@@ -1819,6 +1875,7 @@ fn render_statement(
     let base_indent = indent(indent_level);
     match statement {
         AdaStatement::Null => vec![format!("{base_indent}null;")],
+        AdaStatement::Raise(name) => vec![format!("{base_indent}raise {};", name.as_string())],
         AdaStatement::Exit => vec![format!("{base_indent}exit;")],
         AdaStatement::Continue => vec![format!(
             "{base_indent}goto {};",
@@ -1864,6 +1921,34 @@ fn render_statement(
             )]
         }
         AdaStatement::Call(expr) => vec![format!("{base_indent}{};", render_expr(expr, 0))],
+        AdaStatement::Try {
+            statements,
+            handlers,
+        } => {
+            let mut lines = vec![format!("{base_indent}begin")];
+            lines.extend(render_nested_block(
+                statements,
+                indent_level + 1,
+                context,
+                continue_label,
+            ));
+            lines.push(format!("{base_indent}exception"));
+            for handler in handlers {
+                let selector = match &handler.selector {
+                    AdaExceptionSelector::Name(name) => name.as_string(),
+                    AdaExceptionSelector::Others => "others".to_string(),
+                };
+                lines.push(format!("{base_indent}   when {selector} =>"));
+                lines.extend(render_nested_block(
+                    &handler.body,
+                    indent_level + 2,
+                    context,
+                    continue_label,
+                ));
+            }
+            lines.push(format!("{base_indent}end;"));
+            lines
+        }
         AdaStatement::If(if_statement) => {
             render_if_statement(if_statement, indent_level, context, continue_label)
         }
@@ -1940,6 +2025,15 @@ fn loop_body_contains_continue(statements: &[AdaStatement]) -> bool {
 fn statement_contains_continue_in_current_loop(statement: &AdaStatement) -> bool {
     match statement {
         AdaStatement::Continue => true,
+        AdaStatement::Try {
+            statements,
+            handlers,
+        } => {
+            loop_body_contains_continue(statements)
+                || handlers
+                    .iter()
+                    .any(|handler| loop_body_contains_continue(&handler.body))
+        }
         AdaStatement::Block { statements, .. } => loop_body_contains_continue(statements),
         AdaStatement::If(statement) => {
             loop_body_contains_continue(&statement.then_branch)
@@ -1963,6 +2057,7 @@ fn statement_contains_continue_in_current_loop(statement: &AdaStatement) -> bool
                     .is_some_and(|arm| loop_body_contains_continue(arm))
         }
         AdaStatement::Null
+        | AdaStatement::Raise(_)
         | AdaStatement::Exit
         | AdaStatement::Assert(_)
         | AdaStatement::Return(_)
@@ -2284,8 +2379,18 @@ fn render_expr(expr: &AdaExpr, parent_precedence: u8) -> String {
                 render_expr(index, 0)
             )
         }
+        AdaExpr::Slice { base, start, end } => {
+            format!(
+                "{}({} .. {})",
+                render_expr(base, precedence),
+                render_expr(start, 0),
+                render_expr(end, 0)
+            )
+        }
         AdaExpr::Attribute { prefix, attribute } => {
             let attribute = match attribute {
+                AdaAttribute::First => "First",
+                AdaAttribute::Last => "Last",
                 AdaAttribute::Length => "Length",
                 AdaAttribute::Range => "Range",
                 AdaAttribute::Image => "Image",
@@ -2389,6 +2494,7 @@ fn expr_precedence(expr: &AdaExpr) -> u8 {
         | AdaExpr::TypeQualified { .. }
         | AdaExpr::Qualified { .. }
         | AdaExpr::Index { .. }
+        | AdaExpr::Slice { .. }
         | AdaExpr::Attribute { .. } => 7,
         AdaExpr::Bool(_)
         | AdaExpr::Integer(_)
@@ -2638,6 +2744,7 @@ fn collect_statement_dependencies(
 ) {
     match statement {
         AdaStatement::Null | AdaStatement::Exit | AdaStatement::Continue => {}
+        AdaStatement::Raise(name) => collect_name_dependencies(name, library_units, dependencies),
         AdaStatement::Block {
             declarations,
             statements,
@@ -2651,6 +2758,22 @@ fn collect_statement_dependencies(
         }
         AdaStatement::Assert(expr) | AdaStatement::Call(expr) => {
             collect_expr_dependencies(expr, library_units, dependencies);
+        }
+        AdaStatement::Try {
+            statements,
+            handlers,
+        } => {
+            for nested in statements {
+                collect_statement_dependencies(nested, library_units, dependencies);
+            }
+            for handler in handlers {
+                if let AdaExceptionSelector::Name(name) = &handler.selector {
+                    collect_name_dependencies(name, library_units, dependencies);
+                }
+                for nested in &handler.body {
+                    collect_statement_dependencies(nested, library_units, dependencies);
+                }
+            }
         }
         AdaStatement::Return(Some(expr)) => {
             collect_expr_dependencies(expr, library_units, dependencies);
@@ -2766,6 +2889,11 @@ fn collect_expr_dependencies(
             collect_expr_dependencies(base, library_units, dependencies);
             collect_expr_dependencies(index, library_units, dependencies);
         }
+        AdaExpr::Slice { base, start, end } => {
+            collect_expr_dependencies(base, library_units, dependencies);
+            collect_expr_dependencies(start, library_units, dependencies);
+            collect_expr_dependencies(end, library_units, dependencies);
+        }
         AdaExpr::NamedAggregate(fields) => {
             for (_, value) in fields {
                 collect_expr_dependencies(value, library_units, dependencies);
@@ -2846,6 +2974,7 @@ fn ada_expr_to_name(expr: &AdaExpr) -> Option<Name> {
         | AdaExpr::Result(_)
         | AdaExpr::TypeQualified { .. }
         | AdaExpr::Index { .. }
+        | AdaExpr::Slice { .. }
         | AdaExpr::Attribute { .. }
         | AdaExpr::Call { .. }
         | AdaExpr::NamedAggregate(_)

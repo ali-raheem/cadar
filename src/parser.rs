@@ -1,12 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
         ArrayType, BinaryOp, Block, BlockItem, CallArg, CaseArm, CaseStatement, DependItem,
-        DependTarget, DependsContract, ElseIfBranch, EnumType, Expr, ForStatement, GlobalContract,
-        GlobalItem, GlobalMode, IfStatement, Item, LocalDecl, LoopVariant, LoopVariantDirection,
-        Name, Package, PackageItem, Param, ParamMode, Program, RangeType, RecordField,
-        RecordFieldInit, RecordType, Statement, StatementBlock, Subprogram, TypeDecl, UnaryOp,
+        DependTarget, DependsContract, ElseIfBranch, EnumType, ExceptionHandler, ExceptionSelector,
+        Expr, ForStatement, GlobalContract, GlobalItem, GlobalMode, IfStatement, Item, LocalDecl,
+        LoopVariant, LoopVariantDirection, Name, Package, PackageItem, Param, ParamMode, Program,
+        RangeType, RecordField, RecordFieldInit, RecordType, Statement, StatementBlock, Subprogram,
+        TryStatement, TypeDecl, UnaryOp,
     },
     diagnostic::{Diagnostic, Position},
     lexer::{Token, TokenKind},
@@ -19,11 +20,16 @@ pub fn parse(tokens: &[Token]) -> Result<Program, Diagnostic> {
 struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
+    package_aliases: HashMap<String, Name>,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, index: 0 }
+        Self {
+            tokens,
+            index: 0,
+            package_aliases: HashMap::new(),
+        }
     }
 
     fn parse_program(&mut self) -> Result<Program, Diagnostic> {
@@ -40,15 +46,33 @@ impl<'a> Parser<'a> {
                 let position = self.current().position;
                 self.bump();
                 let name = self.parse_name()?;
+                let alias = self.parse_context_alias()?;
+                if let Some(alias_name) = &alias {
+                    self.package_aliases
+                        .insert(alias_name.clone(), name.clone());
+                }
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after import")?;
-                Ok(Item::Import { name, position })
+                Ok(Item::Import {
+                    name,
+                    alias,
+                    position,
+                })
             }
             TokenKind::Use => {
                 let position = self.current().position;
                 self.bump();
                 let name = self.parse_name()?;
+                let alias = self.parse_context_alias()?;
+                if let Some(alias_name) = &alias {
+                    self.package_aliases
+                        .insert(alias_name.clone(), name.clone());
+                }
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after use")?;
-                Ok(Item::Use { name, position })
+                Ok(Item::Use {
+                    name,
+                    alias,
+                    position,
+                })
             }
             TokenKind::Fn => Ok(Item::Subprogram(self.parse_subprogram()?)),
             TokenKind::Type => Ok(Item::Type(self.parse_type_decl()?)),
@@ -485,6 +509,15 @@ impl<'a> Parser<'a> {
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after `null`")?;
                 Ok(Statement::Null { position })
             }
+            TokenKind::Raise => {
+                self.bump();
+                let exception = self.parse_name()?;
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after `raise`")?;
+                Ok(Statement::Raise {
+                    exception,
+                    position,
+                })
+            }
             TokenKind::Break => {
                 self.bump();
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after `break`")?;
@@ -513,6 +546,7 @@ impl<'a> Parser<'a> {
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after return")?;
                 Ok(Statement::Return { expr, position })
             }
+            TokenKind::Try => self.parse_try_statement(),
             TokenKind::For => self.parse_for_statement(),
             TokenKind::If => self.parse_if_statement(),
             TokenKind::Case => self.parse_case_statement(),
@@ -534,6 +568,48 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.error_here("expected a statement")),
         }
+    }
+
+    fn parse_try_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let position = self.current().position;
+        self.expect_simple(TokenKind::Try, "expected `try`")?;
+        let body = self.parse_statement_block()?;
+
+        let mut handlers = Vec::new();
+        let mut saw_others = false;
+        while self.matches_simple(&TokenKind::Catch) {
+            let handler_position = self.previous_position();
+            self.expect_simple(TokenKind::LParen, "expected `(` after `catch`")?;
+            let selector = if self.matches_simple(&TokenKind::Others) {
+                if saw_others {
+                    return Err(self.error_here("`catch (others)` can only appear once"));
+                }
+                saw_others = true;
+                ExceptionSelector::Others
+            } else {
+                if saw_others {
+                    return Err(self.error_here("`catch (others)` must be the last handler"));
+                }
+                ExceptionSelector::Name(self.parse_name()?)
+            };
+            self.expect_simple(TokenKind::RParen, "expected `)` after catch selector")?;
+            let body = self.parse_statement_block()?;
+            handlers.push(ExceptionHandler {
+                selector,
+                body,
+                position: handler_position,
+            });
+        }
+
+        if handlers.is_empty() {
+            return Err(self.error_here("`try` requires at least one `catch` handler"));
+        }
+
+        Ok(Statement::Try(TryStatement {
+            body,
+            handlers,
+            position,
+        }))
     }
 
     fn parse_if_statement(&mut self) -> Result<Statement, Diagnostic> {
@@ -910,6 +986,7 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         loop {
             if self.matches_simple(&TokenKind::Dot) {
+                expr = self.canonicalize_package_alias_expr(expr);
                 let position = expr.position();
                 let member = self.expect_identifier("expected an identifier after `.`")?;
                 expr = Expr::Member {
@@ -922,12 +999,23 @@ impl<'a> Parser<'a> {
 
             if self.matches_simple(&TokenKind::LBracket) {
                 let position = expr.position();
-                let index = self.parse_expr()?;
-                self.expect_simple(TokenKind::RBracket, "expected `]` after index expression")?;
-                expr = Expr::Index {
-                    base: Box::new(expr),
-                    index: Box::new(index),
-                    position,
+                let start = self.parse_expr()?;
+                expr = if self.matches_simple(&TokenKind::DotDot) {
+                    let end = self.parse_expr()?;
+                    self.expect_simple(TokenKind::RBracket, "expected `]` after slice expression")?;
+                    Expr::Slice {
+                        base: Box::new(expr),
+                        start: Box::new(start),
+                        end: Box::new(end),
+                        position,
+                    }
+                } else {
+                    self.expect_simple(TokenKind::RBracket, "expected `]` after index expression")?;
+                    Expr::Index {
+                        base: Box::new(expr),
+                        index: Box::new(start),
+                        position,
+                    }
                 };
                 continue;
             }
@@ -1085,7 +1173,41 @@ impl<'a> Parser<'a> {
         while self.matches_simple(&TokenKind::Dot) {
             segments.push(self.expect_identifier("expected an identifier after `.`")?);
         }
-        Ok(Name { segments })
+        let mut name = Name { segments };
+        if let Some(target) = self.package_aliases.get(&name.segments[0]) {
+            let mut canonical_segments = target.segments.clone();
+            canonical_segments.extend(name.segments.into_iter().skip(1));
+            name = Name {
+                segments: canonical_segments,
+            };
+        }
+        Ok(name)
+    }
+
+    fn parse_context_alias(&mut self) -> Result<Option<String>, Diagnostic> {
+        if self.matches_simple(&TokenKind::As) {
+            return Ok(Some(
+                self.expect_identifier("expected an alias after `as`")?,
+            ));
+        }
+
+        Ok(None)
+    }
+
+    fn canonicalize_package_alias_expr(&self, expr: Expr) -> Expr {
+        match expr {
+            Expr::Name { mut name, position } => {
+                if let Some(target) = self.package_aliases.get(&name.segments[0]) {
+                    let mut canonical_segments = target.segments.clone();
+                    canonical_segments.extend(name.segments.into_iter().skip(1));
+                    name = Name {
+                        segments: canonical_segments,
+                    };
+                }
+                Expr::Name { name, position }
+            }
+            _ => expr,
+        }
     }
 
     fn looks_like_local_decl(&self) -> bool {
